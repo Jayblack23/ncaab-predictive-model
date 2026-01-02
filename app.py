@@ -16,11 +16,11 @@ SEASON = "2025"
 
 CONF_THRESHOLD = 0.60
 EDGE_THRESHOLD = 3.0
-BANKROLL = 100.0
 
 MIN_GAME_POSSESSIONS = 68
 PACE_SMOOTHING = 0.35
 HOME_BONUS = 1.8
+LEAGUE_AVG_RTG = 100  # SportsDataIO scale
 
 # ============================================================
 # TEAM NAME NORMALIZATION
@@ -107,7 +107,7 @@ def load_odds():
     return requests.get(url, params=params).json()
 
 # ============================================================
-# CORE MODEL (FIXED + CALIBRATED)
+# CORE MODEL (CORRECTED)
 # ============================================================
 
 def projected_total(home, away, TEAM):
@@ -118,9 +118,9 @@ def projected_total(home, away, TEAM):
     raw_poss = (h["poss"] + a["poss"]) / 2
     possessions = raw_poss + PACE_SMOOTHING * (MIN_GAME_POSSESSIONS - raw_poss)
 
-    # Proper efficiency interaction (PPP)
-    home_ppp = (h["off"] / 100) * (a["def"] / 100)
-    away_ppp = (a["off"] / 100) * (h["def"] / 100)
+    # Correct efficiency interaction (league-normalized)
+    home_ppp = (h["off"] / LEAGUE_AVG_RTG) * (LEAGUE_AVG_RTG / a["def"])
+    away_ppp = (a["off"] / LEAGUE_AVG_RTG) * (LEAGUE_AVG_RTG / h["def"])
 
     total = possessions * (home_ppp + away_ppp)
 
