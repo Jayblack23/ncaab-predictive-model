@@ -11,10 +11,10 @@ from datetime import date
 st.set_page_config(page_title="NCAAB Predictive Betting Model", layout="wide")
 
 # ============================================================
-# SESSION STATE INIT (ROI FIX)
+# SESSION STATE (ROI PERSISTENCE)
 # ============================================================
 if "bet_log" not in st.session_state:
-    st.session_state.bet_log = []   # +1 win, -1 loss
+    st.session_state.bet_log = []
 
 if "bets" not in st.session_state:
     st.session_state.bets = []
@@ -26,8 +26,11 @@ LEAGUE_AVG_TEMPO = 68
 LEAGUE_AVG_EFF = 102
 TOTAL_STD_DEV = 11.5
 
+# Fallback regression weights (KenPom-style)
+REGRESSION_WEIGHT = 0.15
+
 # ============================================================
-# TEAM NAME NORMALIZATION
+# TEAM NORMALIZATION
 # ============================================================
 def normalize(name):
     if not name:
@@ -39,7 +42,7 @@ def normalize(name):
     return name.strip()
 
 # ============================================================
-# LOAD TEAM METRICS
+# LOAD TEAM METRICS (2025)
 # ============================================================
 @st.cache_data(ttl=86400)
 def load_teams():
@@ -66,12 +69,10 @@ def get_team(name):
     key = normalize(name)
     if key in TEAM_LOOKUP:
         return TEAM_LOOKUP[key]
-
     for k, v in TEAM_LOOKUP.items():
         if key in k or k in key:
             return v
-
-    raise ValueError(f"Team match failed: {name}")
+    raise ValueError(f"Team not found: {name}")
 
 # ============================================================
 # LOAD TODAY'S GAMES
@@ -87,12 +88,12 @@ def load_games():
 games = load_games()
 
 # ============================================================
-# MODEL FUNCTIONS
+# MODEL CORE
 # ============================================================
 def expected_points(tempo, oe, de):
     return tempo * (oe / de)
 
-def projected_total(home, away):
+def raw_projected_total(home, away):
     A = get_team(home)
     B = get_team(away)
 
@@ -102,6 +103,15 @@ def projected_total(home, away):
     return (
         expected_points(tempo, A["oe"], B["de"]) +
         expected_points(tempo, B["oe"], A["de"])
+    )
+
+def kenpom_style_fallback(proj):
+    """
+    Light regression to league mean to mimic KenPom totals
+    """
+    return (
+        proj * (1 - REGRESSION_WEIGHT)
+        + (LEAGUE_AVG_TEMPO * 2) * REGRESSION_WEIGHT
     )
 
 def prob_over(proj, line):
@@ -129,50 +139,60 @@ with c1:
 with c2:
     home = st.selectbox("Home Team", teams)
 with c3:
-    manual_total = st.number_input("Market Total", 110.0, 180.0, 145.5)
+    manual_total = st.number_input("Market Total (Optional)", 0.0, 200.0, 0.0)
 
 if st.button("Project Matchup"):
-    proj = projected_total(home, away)
-    edge = proj - manual_total
-    prob = prob_over(proj, manual_total)
+    proj = raw_projected_total(home, away)
+    fallback = kenpom_style_fallback(proj)
+
+    line = manual_total if manual_total > 0 else fallback
+    edge = proj - line
+    prob = prob_over(proj, line)
 
     st.metric("Projected Total", round(proj, 2))
+    st.metric("Comparison Line", round(line, 2))
     st.metric("Edge", round(edge, 2))
     st.metric("Over Probability %", round(prob * 100, 1))
 
 # ============================================================
-# TODAY'S SLATE
+# TODAY'S SLATE (MODEL-FIRST + FALLBACK)
 # ============================================================
 st.subheader("📅 Today’s Games")
 
 rows = []
-skipped = 0
 
 for g in games:
     home = g.get("HomeTeam")
     away = g.get("AwayTeam")
-    total = g.get("OverUnder")
-
-    if total in (None, 0):
-        skipped += 1
-        continue
 
     try:
-        total = float(total)
-        if total < 110 or total > 180:
-            skipped += 1
-            continue
+        proj = raw_projected_total(home, away)
+        fallback = kenpom_style_fallback(proj)
 
-        proj = projected_total(home, away)
-        edge = proj - total
-        p_over = prob_over(proj, total)
+        market_total = g.get("OverUnder")
+        if market_total not in (None, 0):
+            market_total = float(market_total)
+            line = market_total
+            source = "Market"
+        else:
+            line = fallback
+            source = "Fallback"
+
+        edge = proj - line
+        p_over = prob_over(proj, line)
         prob = max(p_over, 1 - p_over)
 
-        decision = "BET" if prob * 100 >= min_prob and abs(edge) >= min_edge else "PASS"
+        decision = (
+            "BET" if source == "Market"
+            and prob * 100 >= min_prob
+            and abs(edge) >= min_edge
+            else "PASS"
+        )
 
         rows.append({
             "Game": f"{away} @ {home}",
-            "Market Total": total,
+            "Line Used": round(line, 2),
+            "Line Source": source,
             "Projected Total": round(proj, 2),
             "Edge": round(edge, 2),
             "Prob %": round(prob * 100, 1),
@@ -183,17 +203,11 @@ for g in games:
             st.session_state.bets.append(f"{away} @ {home}")
 
     except Exception as e:
-        skipped += 1
         st.write("Skipped:", away, "@", home, "Reason:", e)
 
 df = pd.DataFrame(rows)
 
-if not df.empty:
-    st.dataframe(df.sort_values("Edge", ascending=False), use_container_width=True)
-else:
-    st.error("Games detected but none passed validation.")
-
-st.caption(f"Games processed: {len(df)} | Skipped: {skipped}")
+st.dataframe(df.sort_values("Edge", ascending=False), use_container_width=True)
 
 # ============================================================
 # ROI TRACKING
@@ -202,32 +216,26 @@ st.subheader("📈 Performance Summary")
 
 if st.session_state.bets:
     st.write("Grade Bets:")
-
     for i, bet in enumerate(st.session_state.bets):
-        col1, col2 = st.columns(2)
-        with col1:
-            st.write(bet)
-        with col2:
-            result = st.selectbox(
-                "Result",
-                ["Pending", "Win", "Loss"],
-                key=f"result_{i}"
-            )
+        result = st.selectbox(
+            bet,
+            ["Pending", "Win", "Loss"],
+            key=f"res_{i}"
+        )
+        if result == "Win":
+            st.session_state.bet_log.append(1)
+        elif result == "Loss":
+            st.session_state.bet_log.append(-1)
 
-            if result == "Win":
-                st.session_state.bet_log.append(1)
-            elif result == "Loss":
-                st.session_state.bet_log.append(-1)
-
-total_bets = len(st.session_state.bet_log)
+total = len(st.session_state.bet_log)
 wins = st.session_state.bet_log.count(1)
 losses = st.session_state.bet_log.count(-1)
 units = sum(st.session_state.bet_log)
 
-roi = round((units / total_bets) * 100, 2) if total_bets else 0
-win_pct = round((wins / total_bets) * 100, 2) if total_bets else 0
+roi = round((units / total) * 100, 2) if total else 0
+win_pct = round((wins / total) * 100, 2) if total else 0
 
-st.metric("Total Bets", total_bets)
+st.metric("Total Bets", total)
 st.metric("Wins", wins)
 st.metric("Losses", losses)
 st.metric("Units", units)
