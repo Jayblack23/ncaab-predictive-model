@@ -17,6 +17,9 @@ SEASON = "2025"
 MIN_POSSESSIONS = 62
 MIN_EFF = 85
 
+PACE_MULTIPLIER = 1.05     # tempo inflation (critical)
+OFF_WEIGHT = 0.6           # offense weighted more than defense
+
 CONF_THRESHOLD = 0.60
 EDGE_THRESHOLD = 3.0
 BANKROLL = 100.0
@@ -111,23 +114,27 @@ def load_odds():
     return r.json()
 
 # ============================================================
-# MODEL
+# MODEL (CALIBRATED)
 # ============================================================
 
 def projected_total(home, away, TEAM):
     h = TEAM[home]
     a = TEAM[away]
 
-    possessions = (h["poss"] + a["poss"]) / 2
+    # Pace inflation
+    pace = ((h["poss"] + a["poss"]) / 2) * PACE_MULTIPLIER
 
-    # CORRECT KenPom-style formula
-    home_pts = possessions * ((h["off"] + a["def"]) / 2) / 100
-    away_pts = possessions * ((a["off"] + h["def"]) / 2) / 100
+    # Offense-weighted efficiency
+    home_eff = (OFF_WEIGHT * h["off"] + (1 - OFF_WEIGHT) * a["def"])
+    away_eff = (OFF_WEIGHT * a["off"] + (1 - OFF_WEIGHT) * h["def"])
+
+    home_pts = pace * home_eff / 100
+    away_pts = pace * away_eff / 100
 
     return round(home_pts + away_pts, 1)
 
 def prob_over(proj, line):
-    std = 11  # historical NCAAB total std dev
+    std = 11
     z = (proj - line) / std
     return round(0.5 * (1 + math.erf(z / math.sqrt(2))), 3)
 
@@ -159,7 +166,7 @@ for g in ODDS:
     if not home or not away:
         continue
 
-    # ---- CONSENSUS MARKET TOTAL ----
+    # ---- Consensus Market Total ----
     lines = []
     for b in g.get("bookmakers", []):
         for m in b.get("markets", []):
@@ -203,7 +210,7 @@ for g in ODDS:
 # ============================================================
 
 if not rows:
-    st.warning("Games detected, but none could be matched to team metrics yet.")
+    st.warning("Games detected, but no valid totals available yet.")
 else:
     df = pd.DataFrame(rows).sort_values("Edge", ascending=False)
     st.dataframe(df, use_container_width=True)
