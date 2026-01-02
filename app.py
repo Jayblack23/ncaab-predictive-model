@@ -60,7 +60,14 @@ st.set_page_config(page_title="NCAAB Totals Model", layout="wide")
 st.title("🏀 NCAAB Predictive Totals Model")
 st.caption("Custom ensemble model (KenPom-style + simulation logic)")
 
-df = pd.read_csv("data.csv")
+st.subheader("🔄 Live Market Totals")
+
+market_df = fetch_ncaab_totals()
+
+# TEMP: manual projection offset (replace with model later)
+market_df["Projection"] = market_df["Line"] + 2.5
+
+df = market_df
 
 results = []
 
