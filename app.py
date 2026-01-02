@@ -18,14 +18,14 @@ TOTAL_STD_DEV = 11.5
 MARKET_CALIBRATION_WEIGHT = 0.25
 
 # ============================================================
-# SESSION STATE (PERSISTENCE)
+# SESSION STATE
 # ============================================================
 for key in ["bet_log", "clv_log"]:
     if key not in st.session_state:
         st.session_state[key] = []
 
 # ============================================================
-# SPORTSDATAIO — TEAM METRICS (2025 SEASON)
+# SPORTSDATAIO — TEAM METRICS (2025)
 # ============================================================
 @st.cache_data(ttl=86400)
 def fetch_team_metrics():
@@ -54,9 +54,9 @@ def fetch_team_metrics():
 teams = fetch_team_metrics()
 
 # ============================================================
-# SPORTSDATAIO — TODAY'S GAMES (AUTO REFRESH)
+# SPORTSDATAIO — TODAY’S GAMES (AUTO REFRESH)
 # ============================================================
-@st.cache_data(ttl=900)  # refresh every 15 minutes
+@st.cache_data(ttl=900)
 def fetch_todays_games():
     headers = {
         "Ocp-Apim-Subscription-Key": st.secrets["SPORTSDATAIO_API_KEY"]
@@ -80,15 +80,15 @@ def expected_points(tempo, off_eff, def_eff):
     return tempo * (off_eff / def_eff)
 
 def project_total(home, away):
-    A = teams[teams.Team == home].iloc[0]
-    B = teams[teams.Team == away].iloc[0]
+    A = teams.loc[teams.Team == home].iloc[0]
+    B = teams.loc[teams.Team == away].iloc[0]
 
     tempo = (A.Tempo + B.Tempo) / 2
     tempo *= LEAGUE_AVG_TEMPO / tempo
 
     return (
-        expected_points(tempo, A.AdjOE, B.AdjDE)
-        + expected_points(tempo, B.AdjOE, A.AdjDE)
+        expected_points(tempo, A.AdjOE, B.AdjDE) +
+        expected_points(tempo, B.AdjOE, A.AdjDE)
     )
 
 def prob_over(projected, line):
@@ -108,31 +108,38 @@ bankroll = st.number_input("Bankroll ($)", value=1000.0, step=100.0)
 min_prob = st.slider("Min Probability (%)", 50, 65, 55)
 min_edge = st.slider("Min Edge (pts)", 1.0, 5.0, 2.0)
 
-st.subheader("📅 Today’s Games (Auto-Updating)")
+st.subheader("📅 Today’s Games")
 
 rows = []
 games_with_totals = 0
+games_processed = 0
 
+# ============================================================
+# GAME LOOP (CORRECTED + SAFE)
+# ============================================================
 for g in games:
+    home = g.get("HomeTeam")
+    away = g.get("AwayTeam")
+    market_total_raw = g.get("OverUnder")
+
+    if not home or not away:
+        continue
+
+    # SAFELY CONVERT TOTAL (STRING → FLOAT)
     try:
-        home = g.get("HomeTeam")
-        away = g.get("AwayTeam")
-        market_total = g.get("OverUnder")  # SAFE READ
+        market_total = float(market_total_raw)
+    except (TypeError, ValueError):
+        continue
 
-        if not home or not away:
-            continue
+    games_with_totals += 1
 
-        if market_total is None or market_total == 0:
-            continue
-
-        games_with_totals += 1
-
+    try:
         raw_proj = project_total(home, away)
 
         # Market calibration
         proj = (
-            raw_proj * (1 - MARKET_CALIBRATION_WEIGHT)
-            + market_total * MARKET_CALIBRATION_WEIGHT
+            raw_proj * (1 - MARKET_CALIBRATION_WEIGHT) +
+            market_total * MARKET_CALIBRATION_WEIGHT
         )
 
         edge = round(proj - market_total, 2)
@@ -161,21 +168,29 @@ for g in games:
             "Decision": decision
         })
 
-    except Exception:
-        continue
+        games_processed += 1
+
+    except Exception as e:
+        st.write("Model error:", home, away)
+        st.write(e)
 
 # ============================================================
 # DISPLAY RESULTS (SAFE)
 # ============================================================
 df = pd.DataFrame(rows)
 
-if df.empty:
-    st.warning("No games with posted totals yet. Check back as lines are released.")
+if df.empty and games_with_totals > 0:
+    st.error("Totals detected but model could not process games.")
+elif df.empty:
+    st.warning("No games with posted totals yet.")
 else:
     df = df.sort_values("Edge", ascending=False)
     st.dataframe(df, use_container_width=True)
 
-st.caption(f"Games with totals available: {games_with_totals}")
+st.caption(
+    f"Games with totals: {games_with_totals} | "
+    f"Games processed: {games_processed}"
+)
 
 # ============================================================
 # LOG BET RESULTS + CLV
@@ -183,7 +198,6 @@ st.caption(f"Games with totals available: {games_with_totals}")
 st.subheader("🧾 Log Bet Result")
 
 c1, c2, c3 = st.columns(3)
-
 with c1:
     result = st.selectbox("Result", ["Win", "Loss"])
 with c2:
@@ -203,9 +217,10 @@ st.subheader("📈 Performance Summary")
 bets = len(st.session_state.bet_log)
 units = sum(st.session_state.bet_log)
 roi = round((units / bets) * 100, 2) if bets else 0
-avg_clv = round(
-    sum(st.session_state.clv_log) / len(st.session_state.clv_log), 2
-) if st.session_state.clv_log else 0
+avg_clv = (
+    round(sum(st.session_state.clv_log) / len(st.session_state.clv_log), 2)
+    if st.session_state.clv_log else 0
+)
 
 p1, p2, p3, p4 = st.columns(4)
 p1.metric("Bets", bets)
@@ -213,4 +228,4 @@ p2.metric("Units", units)
 p3.metric("ROI %", roi)
 p4.metric("Avg CLV", avg_clv)
 
-st.caption("Data: SportsDataIO · For informational use only")
+st.caption("Data: SportsDataIO · Informational use only")
