@@ -73,3 +73,24 @@ for i, row in final_df.iterrows():
 
         if col3.button("LOSS", key=f"loss_{i}"):
             st.session_state.bet_log.append(-1) 
+st.subheader("📈 Performance Summary")
+
+total_bets = len(st.session_state.bet_log)
+wins = st.session_state.bet_log.count(1)
+losses = st.session_state.bet_log.count(-1)
+
+units = sum(st.session_state.bet_log)
+
+if total_bets > 0:
+    roi = round((units / total_bets) * 100, 2)
+    win_pct = round((wins / total_bets) * 100, 2)
+else:
+    roi = 0
+    win_pct = 0
+
+st.metric("Total Bets", total_bets)
+st.metric("Wins", wins)
+st.metric("Losses", losses)
+st.metric("Units", units)
+st.metric("ROI %", roi)
+st.metric("Win %", win_pct)
