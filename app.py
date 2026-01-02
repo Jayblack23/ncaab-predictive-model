@@ -10,11 +10,11 @@ from datetime import date
 st.set_page_config(page_title="NCAAB Totals Model", layout="wide")
 
 # ============================================================
-# CONSTANTS (MODEL CONTROLS)
+# MODEL CONSTANTS
 # ============================================================
 LEAGUE_AVG_TEMPO = 68
 LEAGUE_AVG_EFF = 102
-TOTAL_STD_DEV = 11.5   # empirically reasonable for NCAAB totals
+TOTAL_STD_DEV = 11.5   # realistic NCAAB totals variance
 
 # ============================================================
 # SESSION STATE (ROI PERSISTENCE)
@@ -23,7 +23,7 @@ if "bet_log" not in st.session_state:
     st.session_state.bet_log = []
 
 # ============================================================
-# DATA PULL — SPORTSDATAIO (LEGAL)
+# SPORTSDATAIO — TEAM METRICS (2025 SEASON)
 # ============================================================
 @st.cache_data(ttl=86400)
 def fetch_team_metrics():
@@ -31,12 +31,15 @@ def fetch_team_metrics():
         "Ocp-Apim-Subscription-Key": st.secrets["SPORTSDATAIO_API_KEY"]
     }
 
-    season = 2024
+    # IMPORTANT: SportsDataIO uses SEASON END YEAR
+    season = 2025
     url = f"https://api.sportsdata.io/v3/cbb/stats/json/TeamSeasonStats/{season}"
 
     r = requests.get(url, headers=headers)
+
     if r.status_code != 200:
-        st.error("SportsDataIO API unavailable")
+        st.error(f"SportsDataIO Error {r.status_code}")
+        st.write(r.text)
         st.stop()
 
     data = r.json()
@@ -60,63 +63,65 @@ teams = fetch_team_metrics()
 def expected_points(tempo, off_eff, def_eff):
     return tempo * (off_eff / def_eff)
 
-def game_projection(team_a, team_b):
-    A = teams[teams.Team == team_a].iloc[0]
-    B = teams[teams.Team == team_b].iloc[0]
+def project_game_total(home, away):
+    A = teams[teams.Team == home].iloc[0]
+    B = teams[teams.Team == away].iloc[0]
 
+    # Average & normalize tempo
     tempo = (A.Tempo + B.Tempo) / 2
-    tempo *= LEAGUE_AVG_TEMPO / tempo  # normalization
+    tempo *= LEAGUE_AVG_TEMPO / tempo
 
     pts_a = expected_points(tempo, A.AdjOE, B.AdjDE)
     pts_b = expected_points(tempo, B.AdjOE, A.AdjDE)
 
     return pts_a + pts_b
 
-def over_probability(total, line):
-    z = (total - line) / TOTAL_STD_DEV
+def over_probability(projected, line):
+    z = (projected - line) / TOTAL_STD_DEV
     return 0.5 * (1 + math.erf(z / math.sqrt(2)))
 
 # ============================================================
 # UI — INPUTS
 # ============================================================
-st.title("🏀 College Basketball Totals Model")
+st.title("🏀 College Basketball Totals Model (SportsDataIO)")
 
 team_list = sorted(teams.Team.unique())
-col1, col2, col3 = st.columns(3)
 
-with col1:
+c1, c2, c3 = st.columns(3)
+with c1:
     home = st.selectbox("Home Team", team_list)
-with col2:
+with c2:
     away = st.selectbox("Away Team", team_list)
-with col3:
-    line = st.number_input("Total Line", value=140.5, step=0.5)
+with c3:
+    line = st.number_input("Market Total", value=140.5, step=0.5)
 
-min_prob = st.slider("Minimum Probability %", 50, 65, 55)
-min_edge = st.slider("Minimum Edge (pts)", 1.0, 5.0, 2.0)
+min_prob = st.slider("Minimum Probability (%)", 50, 65, 55)
+min_edge = st.slider("Minimum Edge (Points)", 1.0, 5.0, 2.0)
 
 # ============================================================
 # RUN MODEL
 # ============================================================
 if home != away:
-    projected_total = round(game_projection(home, away), 2)
-    prob_over = round(over_probability(projected_total, line) * 100, 2)
-    edge = round(projected_total - line, 2)
+    projected = round(project_game_total(home, away), 2)
+    edge = round(projected - line, 2)
+    prob = round(over_probability(projected, line) * 100, 2)
 
-    decision = "BET" if prob_over >= min_prob and edge >= min_edge else "PASS"
+    decision = "BET" if prob >= min_prob and edge >= min_edge else "PASS"
 
     st.subheader("📊 Projection")
-    st.metric("Projected Total", projected_total)
-    st.metric("Market Line", line)
-    st.metric("Edge (pts)", edge)
-    st.metric("Over Probability", f"{prob_over}%")
-    st.metric("Decision", decision)
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Projected Total", projected)
+    m2.metric("Market Line", line)
+    m3.metric("Edge", edge)
+    m4.metric("Over Probability", f"{prob}%")
+    m5.metric("Decision", decision)
 
 # ============================================================
-# BET TRACKING
+# BET LOGGING
 # ============================================================
-st.subheader("🧾 Log Result")
+st.subheader("🧾 Log Bet Result")
 
-result = st.radio("Game Result", ["Pending", "Win", "Loss"], horizontal=True)
+result = st.radio("Game Outcome", ["Pending", "Win", "Loss"], horizontal=True)
 
 if st.button("Save Result"):
     if result == "Win":
@@ -134,17 +139,17 @@ wins = st.session_state.bet_log.count(1)
 losses = st.session_state.bet_log.count(-1)
 units = sum(st.session_state.bet_log)
 
-roi = round((units / total_bets) * 100, 2) if total_bets > 0 else 0
-win_pct = round((wins / total_bets) * 100, 2) if total_bets > 0 else 0
+roi = round((units / total_bets) * 100, 2) if total_bets else 0
+win_pct = round((wins / total_bets) * 100, 2) if total_bets else 0
 
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Total Bets", total_bets)
-c2.metric("Wins", wins)
-c3.metric("Losses", losses)
-c4.metric("Units", units)
-c5.metric("ROI %", roi)
+r1, r2, r3, r4, r5 = st.columns(5)
+r1.metric("Total Bets", total_bets)
+r2.metric("Wins", wins)
+r3.metric("Losses", losses)
+r4.metric("Units", units)
+r5.metric("ROI %", roi)
 
 # ============================================================
 # FOOTER
 # ============================================================
-st.caption(f"Last Updated: {date.today()} | Data: SportsDataIO")
+st.caption(f"Updated {date.today()} | Data Source: SportsDataIO | Season: 2025")
