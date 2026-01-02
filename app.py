@@ -1,8 +1,6 @@
 import streamlit as st
 import pandas as pd
-import requests
 import math
-import os
 
 st.set_page_config(page_title="NCAAB Predictive Totals Model", layout="wide")
 
@@ -10,172 +8,118 @@ st.set_page_config(page_title="NCAAB Predictive Totals Model", layout="wide")
 # CONFIG
 # ============================================================
 
-ODDS_API_KEY = st.secrets["ODDS_API_KEY"]
-
-CONF_THRESHOLD = 0.60
-EDGE_THRESHOLD = 3.0
-
-MIN_GAME_POSSESSIONS = 68
-PACE_SMOOTHING = 0.30
-HOME_BONUS = 1.8
-LEAGUE_AVG_RTG = 100
-
-DATA_FILE = "team_stats.csv"
+LEAGUE_AVG_RTG = 103.0
+MIN_POSSESSIONS = 65
+STD_TOTAL = 11.0
 
 # ============================================================
 # TEAM NAME NORMALIZATION
 # ============================================================
 
 ALIASES = {
-    "ole miss": "mississippi",
-    "uconn": "connecticut",
     "st marys": "saint marys",
     "st johns": "saint johns",
-    "unc": "north carolina",
-    "uva": "virginia",
+    "nc state": "north carolina state",
+    "michigan st": "michigan state",
 }
 
 def normalize(name):
-    if not name:
-        return ""
-    name = (
-        name.lower()
-        .replace("&", "and")
+    return (
+        str(name)
+        .lower()
         .replace(".", "")
+        .replace("&", "and")
         .replace("'", "")
         .strip()
     )
-    return ALIASES.get(name, name)
-
-def resolve(name, teams):
-    for t in teams:
-        if name == t or name in t or t in name:
-            return t
-    return None
 
 # ============================================================
-# LOAD TEAM STATS (LOCAL CSV — SAFE)
+# LOAD BART TORVIK CSV
 # ============================================================
 
 @st.cache_data(ttl=86400)
-def load_team_stats():
-    if not os.path.exists(DATA_FILE):
-        st.error("team_stats.csv not found. Please add it to the project root.")
-        st.stop()
+def load_team_stats(df):
+    cols = {c.lower(): c for c in df.columns}
 
-    df = pd.read_csv(DATA_FILE)
+    def find_col(options):
+        for o in options:
+            if o.lower() in cols:
+                return cols[o.lower()]
+        return None
 
-    required = {"Team", "Tempo", "AdjOE", "AdjDE"}
-    if not required.issubset(df.columns):
-        st.error("team_stats.csv must contain: Team, Tempo, AdjOE, AdjDE")
+    team_col = find_col(["team"])
+    tempo_col = find_col(["tempo", "pace"])
+    off_col = find_col(["adjoe", "oe"])
+    def_col = find_col(["adjde", "de"])
+
+    if not all([team_col, tempo_col, off_col, def_col]):
+        st.error("CSV must include Team, Tempo, AdjOE/OE, AdjDE/DE")
         st.stop()
 
     teams = {}
     for _, r in df.iterrows():
-        teams[normalize(r["Team"])] = {
-            "poss": float(r["Tempo"]),
-            "off": float(r["AdjOE"]),
-            "def": float(r["AdjDE"]),
+        teams[normalize(r[team_col])] = {
+            "tempo": float(r[tempo_col]),
+            "off": float(r[off_col]),
+            "def": float(r[def_col]),
         }
 
     return teams
 
 # ============================================================
-# LOAD ODDS
-# ============================================================
-
-@st.cache_data(ttl=300)
-def load_odds():
-    url = "https://api.the-odds-api.com/v4/sports/basketball_ncaab/odds"
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "regions": "us",
-        "markets": "totals",
-        "oddsFormat": "american",
-    }
-    return requests.get(url, params=params).json()
-
-# ============================================================
-# CORE MODEL
+# CORE TOTALS MODEL (FIXED)
 # ============================================================
 
 def projected_total(home, away, TEAM):
     h = TEAM[home]
     a = TEAM[away]
 
-    raw_poss = (h["poss"] + a["poss"]) / 2
-    possessions = raw_poss + PACE_SMOOTHING * (MIN_GAME_POSSESSIONS - raw_poss)
+    # Possessions
+    possessions = max((h["tempo"] + a["tempo"]) / 2, MIN_POSSESSIONS)
 
+    # Offensive efficiency vs opponent defense
     home_ppp = (h["off"] / LEAGUE_AVG_RTG) * (LEAGUE_AVG_RTG / a["def"])
     away_ppp = (a["off"] / LEAGUE_AVG_RTG) * (LEAGUE_AVG_RTG / h["def"])
 
     total = possessions * (home_ppp + away_ppp)
-    total += HOME_BONUS
-
     return round(total, 1)
 
 def prob_over(proj, line):
-    std = 11
-    z = (proj - line) / std
+    z = (proj - line) / STD_TOTAL
     return 0.5 * (1 + math.erf(z / math.sqrt(2)))
 
 # ============================================================
 # UI
 # ============================================================
 
-st.title("🏀 NCAAB Predictive Totals Model")
+st.title("🏀 NCAAB Predictive Totals Model (Bart Torvik)")
 
-TEAM = load_team_stats()
-ODDS = load_odds()
+uploaded = st.file_uploader(
+    "Upload Bart Torvik CSV (Team, Tempo, AdjOE, AdjDE)",
+    type=["csv"]
+)
 
-rows = []
+if not uploaded:
+    st.info("Please upload a Bart Torvik CSV to continue.")
+    st.stop()
 
-for g in ODDS:
-    home_raw = normalize(g.get("home_team"))
-    away_raw = normalize(g.get("away_team"))
+df = pd.read_csv(uploaded)
+TEAM = load_team_stats(df)
 
-    home = resolve(home_raw, TEAM)
-    away = resolve(away_raw, TEAM)
+home_team = st.text_input("Home Team")
+away_team = st.text_input("Away Team")
+market_total = st.number_input("Market Total", value=140.5)
 
-    if not home or not away:
-        continue
+if st.button("Project Total"):
+    h = normalize(home_team)
+    a = normalize(away_team)
 
-    totals = []
-    for b in g.get("bookmakers", []):
-        for m in b.get("markets", []):
-            if m.get("key") == "totals":
-                for o in m.get("outcomes", []):
-                    if o.get("name") == "Over" and isinstance(o.get("point"), (int, float)):
-                        totals.append(o["point"])
+    if h not in TEAM or a not in TEAM:
+        st.error("One or both teams not found in CSV")
+    else:
+        proj = projected_total(h, a, TEAM)
+        prob = prob_over(proj, market_total)
 
-    if not totals:
-        continue
-
-    market_total = round(sum(totals) / len(totals), 1)
-    proj = projected_total(home, away, TEAM)
-    edge = round(proj - market_total, 2)
-    prob = prob_over(proj, market_total)
-
-    decision = "BET" if prob >= CONF_THRESHOLD and edge >= EDGE_THRESHOLD else "PASS"
-
-    confidence = (
-        "⭐⭐⭐" if prob >= 0.65 else
-        "⭐⭐" if prob >= 0.60 else
-        "⭐"
-    )
-
-    rows.append({
-        "Game": f"{g['away_team']} @ {g['home_team']}",
-        "Market Total": market_total,
-        "Projected Total": proj,
-        "Edge": edge,
-        "Probability %": round(prob * 100, 1),
-        "Confidence": confidence,
-        "Decision": decision,
-    })
-
-if not rows:
-    st.warning("No valid games found.")
-else:
-    df = pd.DataFrame(rows).sort_values("Edge", ascending=False)
-    st.dataframe(df, use_container_width=True)
+        st.metric("Projected Total", proj)
+        st.metric("Edge", round(proj - market_total, 1))
+        st.metric("Over Probability", f"{prob*100:.1f}%")
