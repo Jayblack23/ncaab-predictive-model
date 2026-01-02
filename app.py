@@ -7,10 +7,10 @@ import requests
 import math
 from datetime import date
 
-st.set_page_config(page_title="NCAAB Betting Model", layout="wide")
+st.set_page_config(page_title="NCAAB Predictive Betting Model", layout="wide")
 
 # ============================================================
-# MODEL CONSTANTS
+# CONSTANTS
 # ============================================================
 LEAGUE_AVG_TEMPO = 68
 LEAGUE_AVG_EFF = 102
@@ -20,24 +20,23 @@ MARKET_CALIBRATION_WEIGHT = 0.25
 # ============================================================
 # SESSION STATE
 # ============================================================
-for key in ["bet_log", "clv_log"]:
-    if key not in st.session_state:
-        st.session_state[key] = []
+for k in ["bet_log", "clv_log"]:
+    if k not in st.session_state:
+        st.session_state[k] = []
 
 # ============================================================
-# SPORTSDATAIO — TEAM METRICS (2025)
+# FETCH TEAM METRICS (2025 SEASON)
 # ============================================================
 @st.cache_data(ttl=86400)
 def fetch_team_metrics():
     headers = {
         "Ocp-Apim-Subscription-Key": st.secrets["SPORTSDATAIO_API_KEY"]
     }
-
     url = "https://api.sportsdata.io/v3/cbb/stats/json/TeamSeasonStats/2025"
     r = requests.get(url, headers=headers)
 
     if r.status_code != 200:
-        st.error(f"SportsDataIO Error {r.status_code}")
+        st.error("Failed to load team metrics")
         st.stop()
 
     rows = []
@@ -54,14 +53,13 @@ def fetch_team_metrics():
 teams = fetch_team_metrics()
 
 # ============================================================
-# SPORTSDATAIO — TODAY’S GAMES (AUTO REFRESH)
+# FETCH TODAY’S GAMES
 # ============================================================
 @st.cache_data(ttl=900)
 def fetch_todays_games():
     headers = {
         "Ocp-Apim-Subscription-Key": st.secrets["SPORTSDATAIO_API_KEY"]
     }
-
     today = date.today().strftime("%Y-%m-%d")
     url = f"https://api.sportsdata.io/v3/cbb/scores/json/GamesByDate/{today}"
 
@@ -74,14 +72,20 @@ def fetch_todays_games():
 games = fetch_todays_games()
 
 # ============================================================
-# MODEL FUNCTIONS
+# MODEL FUNCTIONS (SAFE)
 # ============================================================
 def expected_points(tempo, off_eff, def_eff):
     return tempo * (off_eff / def_eff)
 
 def project_total(home, away):
-    A = teams.loc[teams.Team == home].iloc[0]
-    B = teams.loc[teams.Team == away].iloc[0]
+    A_df = teams.loc[teams.Team == home]
+    B_df = teams.loc[teams.Team == away]
+
+    if A_df.empty or B_df.empty:
+        raise ValueError("Team not found in metrics")
+
+    A = A_df.iloc[0]
+    B = B_df.iloc[0]
 
     tempo = (A.Tempo + B.Tempo) / 2
     tempo *= LEAGUE_AVG_TEMPO / tempo
@@ -102,20 +106,21 @@ def kelly_fraction(prob, odds=-110):
 # ============================================================
 # UI CONTROLS
 # ============================================================
-st.title("🏀 College Basketball Betting Model")
+st.title("🏀 College Basketball Predictive Betting Model")
 
 bankroll = st.number_input("Bankroll ($)", value=1000.0, step=100.0)
-min_prob = st.slider("Min Probability (%)", 50, 65, 55)
-min_edge = st.slider("Min Edge (pts)", 1.0, 5.0, 2.0)
+min_prob = st.slider("Minimum Probability (%)", 50, 65, 55)
+min_edge = st.slider("Minimum Edge (pts)", 1.0, 5.0, 2.0)
 
 st.subheader("📅 Today’s Games")
 
 rows = []
 games_with_totals = 0
 games_processed = 0
+games_skipped = 0
 
 # ============================================================
-# GAME LOOP (CORRECTED + SAFE)
+# MAIN GAME LOOP (FULLY SAFE)
 # ============================================================
 for g in games:
     home = g.get("HomeTeam")
@@ -125,7 +130,7 @@ for g in games:
     if not home or not away:
         continue
 
-    # SAFELY CONVERT TOTAL (STRING → FLOAT)
+    # Convert market total safely
     try:
         market_total = float(market_total_raw)
     except (TypeError, ValueError):
@@ -136,7 +141,6 @@ for g in games:
     try:
         raw_proj = project_total(home, away)
 
-        # Market calibration
         proj = (
             raw_proj * (1 - MARKET_CALIBRATION_WEIGHT) +
             market_total * MARKET_CALIBRATION_WEIGHT
@@ -159,8 +163,8 @@ for g in games:
 
         rows.append({
             "Game": f"{away} @ {home}",
-            "Market": market_total,
-            "Projected": round(proj, 2),
+            "Market Total": market_total,
+            "Projected Total": round(proj, 2),
             "Edge": edge,
             "Side": side,
             "Prob %": round(prob * 100, 1),
@@ -170,17 +174,16 @@ for g in games:
 
         games_processed += 1
 
-    except Exception as e:
-        st.write("Model error:", home, away)
-        st.write(e)
+    except ValueError:
+        games_skipped += 1
 
 # ============================================================
-# DISPLAY RESULTS (SAFE)
+# DISPLAY RESULTS
 # ============================================================
 df = pd.DataFrame(rows)
 
 if df.empty and games_with_totals > 0:
-    st.error("Totals detected but model could not process games.")
+    st.error("Totals exist, but teams could not be matched to metrics.")
 elif df.empty:
     st.warning("No games with posted totals yet.")
 else:
@@ -189,11 +192,12 @@ else:
 
 st.caption(
     f"Games with totals: {games_with_totals} | "
-    f"Games processed: {games_processed}"
+    f"Processed: {games_processed} | "
+    f"Skipped (team mismatch): {games_skipped}"
 )
 
 # ============================================================
-# LOG BET RESULTS + CLV
+# BET LOGGING
 # ============================================================
 st.subheader("🧾 Log Bet Result")
 
@@ -217,15 +221,12 @@ st.subheader("📈 Performance Summary")
 bets = len(st.session_state.bet_log)
 units = sum(st.session_state.bet_log)
 roi = round((units / bets) * 100, 2) if bets else 0
-avg_clv = (
-    round(sum(st.session_state.clv_log) / len(st.session_state.clv_log), 2)
-    if st.session_state.clv_log else 0
-)
+avg_clv = round(sum(st.session_state.clv_log) / len(st.session_state.clv_log), 2) if st.session_state.clv_log else 0
 
-p1, p2, p3, p4 = st.columns(4)
-p1.metric("Bets", bets)
-p2.metric("Units", units)
-p3.metric("ROI %", roi)
-p4.metric("Avg CLV", avg_clv)
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Bets", bets)
+m2.metric("Units", units)
+m3.metric("ROI %", roi)
+m4.metric("Avg CLV", avg_clv)
 
-st.caption("Data: SportsDataIO · Informational use only")
+st.caption("Data: SportsDataIO · For informational purposes only")
