@@ -7,14 +7,11 @@ import requests
 import math
 from datetime import date
 
-st.set_page_config(page_title="NCAAB Totals Model", layout="wide")
+st.set_page_config(page_title="NCAAB Totals Betting Model", layout="wide")
 
 # ============================================================
 # SESSION STATE
 # ============================================================
-if "bet_log" not in st.session_state:
-    st.session_state.bet_log = []  # +1 / -1 results
-
 if "bankroll" not in st.session_state:
     st.session_state.bankroll = 100.0
 
@@ -27,7 +24,6 @@ REGRESSION_WEIGHT = 0.15
 LEAGUE_AVG_TOTAL = 142
 MIN_FALLBACK_TOTAL = 125
 MAX_FALLBACK_TOTAL = 165
-VALID_TOTAL_RANGE = (120, 170)
 
 MIN_POSSESSIONS = 60
 MIN_EFF = 80
@@ -73,7 +69,7 @@ TEAM = teams_df.set_index("TeamID").to_dict("index")
 NAME = teams_df.set_index("TeamID")["Name"].to_dict()
 
 # ============================================================
-# LOAD TODAY'S GAMES
+# LOAD TODAY'S GAMES (SPORTSDATAIO)
 # ============================================================
 @st.cache_data(ttl=600)
 def load_games():
@@ -84,6 +80,37 @@ def load_games():
     return r.json() if r.status_code == 200 else []
 
 games = load_games()
+
+# ============================================================
+# LOAD ODDS (ODDS API)
+# ============================================================
+@st.cache_data(ttl=300)
+def load_odds():
+    url = "https://api.the-odds-api.com/v4/sports/basketball_ncaab/odds"
+    params = {
+        "apiKey": st.secrets["ODDS_API_KEY"],
+        "regions": "us",
+        "markets": "totals",
+        "oddsFormat": "decimal"
+    }
+    r = requests.get(url, params=params)
+    return r.json() if r.status_code == 200 else []
+
+odds_data = load_odds()
+
+# Normalize Odds API data
+ODDS = {}
+for g in odds_data:
+    home = g["home_team"].lower()
+    away = g["away_team"].lower()
+
+    for b in g.get("bookmakers", []):
+        for m in b.get("markets", []):
+            if m["key"] == "totals":
+                total = m["outcomes"][0].get("point")
+                if total:
+                    ODDS[(away, home)] = float(total)
+                    break
 
 # ============================================================
 # MODEL CORE
@@ -98,9 +125,9 @@ def ratings(t):
     drtg = (t["OppPoints"] / t["Games"]) / poss * 100
     return poss, max(ortg, MIN_EFF), max(drtg, MIN_EFF)
 
-def projected_total(home_id, away_id):
-    hp, ho, hd = ratings(TEAM[home_id])
-    ap, ao, ad = ratings(TEAM[away_id])
+def projected_total(h, a):
+    hp, ho, hd = ratings(TEAM[h])
+    ap, ao, ad = ratings(TEAM[a])
     poss = (hp + ap) / 2 * HOME_PACE_BONUS
     return poss * (ho / ad + ao / hd)
 
@@ -117,7 +144,7 @@ def kelly_stake(prob):
     return min(max(raw * 100, 0), MAX_STAKE_PCT)
 
 # ============================================================
-# UI CONTROLS
+# UI
 # ============================================================
 st.title("🏀 College Basketball Totals Betting Model")
 
@@ -129,10 +156,10 @@ st.session_state.bankroll = st.number_input(
 )
 
 min_prob = st.slider("Minimum Probability (%)", 50, 65, 55)
-min_edge = st.slider("Minimum Edge (points)", 1.0, 6.0, 2.0)
+min_edge = st.slider("Minimum Edge (pts)", 1.0, 6.0, 2.0)
 
 # ============================================================
-# BUILD TODAY'S SLATE
+# BUILD SLATE
 # ============================================================
 rows = []
 
@@ -141,16 +168,19 @@ for g in games:
     if h not in TEAM or a not in TEAM:
         continue
 
-    proj = projected_total(h, a)
-    market = g.get("OverUnder")
+    home_name = NAME[h].lower()
+    away_name = NAME[a].lower()
 
-    if market and VALID_TOTAL_RANGE[0] <= market <= VALID_TOTAL_RANGE[1]:
-        line = float(market)
+    proj = projected_total(h, a)
+
+    # ODDS API FIRST
+    if (away_name, home_name) in ODDS:
+        line = ODDS[(away_name, home_name)]
         source = "Market"
         adj_prob, adj_edge = min_prob, min_edge
     else:
         line = fallback_total(proj)
-        source = "Fallback"
+        source = "Implied"
         adj_prob, adj_edge = min_prob + 3, min_edge + 1
 
     p_over = prob_over(proj, line)
@@ -161,7 +191,6 @@ for g in games:
     else:
         side, prob, edge = "UNDER", p_under, line - proj
 
-    # AUTO BET RULE
     auto_bet = prob >= AUTO_BET_PROB and abs(edge) >= AUTO_BET_EDGE
 
     decision = (
@@ -170,7 +199,6 @@ for g in games:
         else "PASS"
     )
 
-    # CONFIDENCE STARS
     if prob >= 0.62:
         confidence = "⭐⭐⭐"
     elif prob >= 0.58:
@@ -185,6 +213,7 @@ for g in games:
         "Game": f"{NAME[a]} @ {NAME[h]}",
         "Side": side,
         "Line": round(line, 1),
+        "Line Source": source,
         "Projected Total": round(proj, 1),
         "Edge": round(edge, 1),
         "Prob %": round(prob * 100, 1),
@@ -195,23 +224,3 @@ for g in games:
 
 df = pd.DataFrame(rows).sort_values("Edge", ascending=False)
 st.dataframe(df, use_container_width=True)
-
-# ============================================================
-# ROI / PERFORMANCE SUMMARY
-# ============================================================
-st.subheader("📈 Performance Summary")
-
-total = len(st.session_state.bet_log)
-wins = st.session_state.bet_log.count(1)
-losses = st.session_state.bet_log.count(-1)
-units = sum(st.session_state.bet_log)
-
-roi = round((units / total) * 100, 2) if total else 0
-win_pct = round((wins / total) * 100, 2) if total else 0
-
-st.metric("Total Bets", total)
-st.metric("Wins", wins)
-st.metric("Losses", losses)
-st.metric("Units", units)
-st.metric("ROI %", roi)
-st.metric("Win %", win_pct)
