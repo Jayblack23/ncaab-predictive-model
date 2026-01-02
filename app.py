@@ -1,8 +1,9 @@
 import streamlit as st
 import pandas as pd
 import math
+import os
 
-st.set_page_config(page_title="NCAAB Predictive Totals Model", layout="wide")
+st.set_page_config(page_title="NCAAB Totals Model", layout="wide")
 
 # ============================================================
 # CONFIG
@@ -11,6 +12,7 @@ st.set_page_config(page_title="NCAAB Predictive Totals Model", layout="wide")
 LEAGUE_AVG_RTG = 103.0
 MIN_POSSESSIONS = 65
 STD_TOTAL = 11.0
+DATA_FILE = "team_stats.csv"
 
 # ============================================================
 # TEAM NAME NORMALIZATION
@@ -19,7 +21,6 @@ STD_TOTAL = 11.0
 ALIASES = {
     "st marys": "saint marys",
     "st johns": "saint johns",
-    "nc state": "north carolina state",
     "michigan st": "michigan state",
 }
 
@@ -34,50 +35,37 @@ def normalize(name):
     )
 
 # ============================================================
-# LOAD BART TORVIK CSV
+# LOAD TEAM STATS
 # ============================================================
 
-@st.cache_data(ttl=86400)
-def load_team_stats(df):
-    cols = {c.lower(): c for c in df.columns}
-
-    def find_col(options):
-        for o in options:
-            if o.lower() in cols:
-                return cols[o.lower()]
-        return None
-
-    team_col = find_col(["team"])
-    tempo_col = find_col(["tempo", "pace"])
-    off_col = find_col(["adjoe", "oe"])
-    def_col = find_col(["adjde", "de"])
-
-    if not all([team_col, tempo_col, off_col, def_col]):
-        st.error("CSV must include Team, Tempo, AdjOE/OE, AdjDE/DE")
+@st.cache_data(ttl=3600)
+def load_team_stats():
+    if not os.path.exists(DATA_FILE):
+        st.error("team_stats.csv not found. Run torvik_scraper.py")
         st.stop()
+
+    df = pd.read_csv(DATA_FILE)
 
     teams = {}
     for _, r in df.iterrows():
-        teams[normalize(r[team_col])] = {
-            "tempo": float(r[tempo_col]),
-            "off": float(r[off_col]),
-            "def": float(r[def_col]),
+        teams[normalize(r["Team"])] = {
+            "tempo": float(r["Tempo"]),
+            "off": float(r["AdjOE"]),
+            "def": float(r["AdjDE"]),
         }
 
     return teams
 
 # ============================================================
-# CORE TOTALS MODEL (FIXED)
+# CORE MODEL
 # ============================================================
 
 def projected_total(home, away, TEAM):
     h = TEAM[home]
     a = TEAM[away]
 
-    # Possessions
     possessions = max((h["tempo"] + a["tempo"]) / 2, MIN_POSSESSIONS)
 
-    # Offensive efficiency vs opponent defense
     home_ppp = (h["off"] / LEAGUE_AVG_RTG) * (LEAGUE_AVG_RTG / a["def"])
     away_ppp = (a["off"] / LEAGUE_AVG_RTG) * (LEAGUE_AVG_RTG / h["def"])
 
@@ -92,19 +80,9 @@ def prob_over(proj, line):
 # UI
 # ============================================================
 
-st.title("🏀 NCAAB Predictive Totals Model (Bart Torvik)")
+st.title("🏀 NCAAB Predictive Totals Model (Auto-Updated)")
 
-uploaded = st.file_uploader(
-    "Upload Bart Torvik CSV (Team, Tempo, AdjOE, AdjDE)",
-    type=["csv"]
-)
-
-if not uploaded:
-    st.info("Please upload a Bart Torvik CSV to continue.")
-    st.stop()
-
-df = pd.read_csv(uploaded)
-TEAM = load_team_stats(df)
+TEAM = load_team_stats()
 
 home_team = st.text_input("Home Team")
 away_team = st.text_input("Away Team")
@@ -115,7 +93,7 @@ if st.button("Project Total"):
     a = normalize(away_team)
 
     if h not in TEAM or a not in TEAM:
-        st.error("One or both teams not found in CSV")
+        st.error("Team not found in team_stats.csv")
     else:
         proj = projected_total(h, a, TEAM)
         prob = prob_over(proj, market_total)
