@@ -3,7 +3,7 @@ import pandas as pd
 import requests
 import math
 
-st.set_page_config(page_title="NCAAB Predictive Totals", layout="wide")
+st.set_page_config(page_title="NCAAB Predictive Totals Model", layout="wide")
 
 # ============================================================
 # CONFIG
@@ -13,6 +13,7 @@ SPORTSDATAIO_KEY = st.secrets["SPORTSDATAIO_API_KEY"]
 ODDS_API_KEY = st.secrets["ODDS_API_KEY"]
 
 SEASON = "2025"
+
 MIN_POSSESSIONS = 62
 MIN_EFF = 85
 
@@ -21,27 +22,39 @@ EDGE_THRESHOLD = 3.0
 BANKROLL = 100.0
 
 # ============================================================
-# TEAM NAME NORMALIZATION
+# TEAM NAME NORMALIZATION + ALIASES
 # ============================================================
 
 TEAM_ALIASES = {
     "ole miss": "mississippi",
     "uconn": "connecticut",
     "st marys": "saint marys",
+    "st johns": "saint johns",
     "unc": "north carolina",
     "uva": "virginia",
 }
 
 def normalize(name: str) -> str:
+    if not name:
+        return ""
     n = (
         name.lower()
         .replace("&", "and")
         .replace(".", "")
+        .replace("'", "")
         .replace("state", "st")
         .replace("saint", "saint")
         .strip()
     )
     return TEAM_ALIASES.get(n, n)
+
+def resolve_team(name, TEAM):
+    if name in TEAM:
+        return name
+    for t in TEAM:
+        if name in t or t in name:
+            return t
+    return None
 
 # ============================================================
 # LOAD TEAM STATS (SPORTSDATAIO)
@@ -107,8 +120,9 @@ def projected_total(home, away, TEAM):
 
     possessions = (h["poss"] + a["poss"]) / 2
 
-    home_pts = possessions * (h["off"] / a["def"])
-    away_pts = possessions * (a["off"] / h["def"])
+    # CORRECT KenPom-style formula
+    home_pts = possessions * ((h["off"] + a["def"]) / 2) / 100
+    away_pts = possessions * ((a["off"] + h["def"]) / 2) / 100
 
     return round(home_pts + away_pts, 1)
 
@@ -136,13 +150,16 @@ ODDS = load_odds()
 rows = []
 
 for g in ODDS:
-    home = normalize(g.get("home_team", ""))
-    away = normalize(g.get("away_team", ""))
+    home_raw = normalize(g.get("home_team", ""))
+    away_raw = normalize(g.get("away_team", ""))
 
-    if home not in TEAM or away not in TEAM:
+    home = resolve_team(home_raw, TEAM)
+    away = resolve_team(away_raw, TEAM)
+
+    if not home or not away:
         continue
 
-    # --- consensus market total ---
+    # ---- CONSENSUS MARKET TOTAL ----
     lines = []
     for b in g.get("bookmakers", []):
         for m in b.get("markets", []):
@@ -186,7 +203,7 @@ for g in ODDS:
 # ============================================================
 
 if not rows:
-    st.warning("Games detected, but no valid totals available yet.")
+    st.warning("Games detected, but none could be matched to team metrics yet.")
 else:
     df = pd.DataFrame(rows).sort_values("Edge", ascending=False)
     st.dataframe(df, use_container_width=True)
