@@ -2,6 +2,10 @@ import os
 import streamlit as st
 import pandas as pd
 from math import erf, sqrt
+BET_FILE = "bets.csv"
+
+if not os.path.exists(BET_FILE):
+    pd.DataFrame(columns=["Result"]).to_csv(BET_FILE, index=False)
 if "bet_log" not in st.session_state:
     st.session_state.bet_log = []
 # ---------- Helper functions ----------
