@@ -15,12 +15,6 @@ st.set_page_config(page_title="NCAAB Predictive Model", layout="wide")
 if "bet_log" not in st.session_state:
     st.session_state.bet_log = []
 
-if "clv_log" not in st.session_state:
-    st.session_state.clv_log = []
-
-if "graded_games" not in st.session_state:
-    st.session_state.graded_games = set()
-
 # ============================================================
 # CONSTANTS / GUARDRAILS
 # ============================================================
@@ -36,11 +30,13 @@ MIN_POSSESSIONS = 60
 MIN_EFF = 80
 
 HOME_PACE_BONUS = 1.02
-AWAY_PACE_PENALTY = 0.98
-RECENT_WEIGHT = 0.65
+
+# Kelly safety
+KELLY_FRACTION = 0.5
+MAX_STAKE_PCT = 5.0
 
 # ============================================================
-# LOAD TEAM STATS (SPORTSDATAIO – SAFE SCHEMA)
+# LOAD TEAM STATS
 # ============================================================
 @st.cache_data(ttl=86400)
 def load_teams():
@@ -50,16 +46,16 @@ def load_teams():
 
     teams = []
     for t in r.json():
-        games = t.get("Games", 0)
-        if games == 0:
+        g = t.get("Games", 0)
+        if g == 0:
             continue
 
         teams.append({
             "TeamID": t["TeamID"],
             "Name": t["Name"],
-            "Games": games,
+            "Games": g,
             "Points": t.get("Points", 0),
-            "PointsAllowed": t.get("OpponentPointsPerGame", 0) * games,
+            "OppPoints": t.get("OpponentPointsPerGame", 0) * g,
             "FGA": t.get("FieldGoalsAttempted", 0),
             "FTA": t.get("FreeThrowsAttempted", 0),
             "ORB": t.get("OffensiveRebounds", 0),
@@ -70,7 +66,7 @@ def load_teams():
 
 teams_df = load_teams()
 TEAM = teams_df.set_index("TeamID").to_dict("index")
-TEAM_NAME = teams_df.set_index("TeamID")["Name"].to_dict()
+NAME = teams_df.set_index("TeamID")["Name"].to_dict()
 
 # ============================================================
 # LOAD TODAY'S GAMES
@@ -88,149 +84,102 @@ games = load_games()
 # ============================================================
 # MODEL CORE
 # ============================================================
-def estimate_possessions(team):
-    poss = (
-        team["FGA"]
-        - team["ORB"]
-        + team["TOV"]
-        + 0.44 * team["FTA"]
-    ) / team["Games"]
+def possessions(t):
+    p = (t["FGA"] - t["ORB"] + t["TOV"] + 0.44 * t["FTA"]) / t["Games"]
+    return max(p, MIN_POSSESSIONS)
 
-    return max(poss, MIN_POSSESSIONS)
-
-def team_ratings(team):
-    poss = estimate_possessions(team)
-
-    ortg = (team["Points"] / team["Games"]) / poss * 100
-    drtg = (team["PointsAllowed"] / team["Games"]) / poss * 100
-
+def ratings(t):
+    poss = possessions(t)
+    ortg = (t["Points"] / t["Games"]) / poss * 100
+    drtg = (t["OppPoints"] / t["Games"]) / poss * 100
     return poss, max(ortg, MIN_EFF), max(drtg, MIN_EFF)
 
-def projected_total(home_id, away_id):
-    home = TEAM[home_id]
-    away = TEAM[away_id]
+def projected_total(h, a):
+    hp, ho, hd = ratings(TEAM[h])
+    ap, ao, ad = ratings(TEAM[a])
 
-    h_poss, h_ortg, h_drtg = team_ratings(home)
-    a_poss, a_ortg, a_drtg = team_ratings(away)
-
-    # Opponent-adjusted tempo
-    possessions = (h_poss + a_poss) / 2
-
-    # Home/Away pace adjustment
-    possessions *= HOME_PACE_BONUS
-
-    home_pts = possessions * (h_ortg / a_drtg)
-    away_pts = possessions * (a_ortg / h_drtg)
-
+    poss = (hp + ap) / 2 * HOME_PACE_BONUS
+    home_pts = poss * (ho / ad)
+    away_pts = poss * (ao / hd)
     return home_pts + away_pts
 
-def fallback_total(proj):
-    regressed = proj * (1 - REGRESSION_WEIGHT) + LEAGUE_AVG_TOTAL * REGRESSION_WEIGHT
-    return min(max(regressed, MIN_FALLBACK_TOTAL), MAX_FALLBACK_TOTAL)
+def fallback_total(p):
+    reg = p * (1 - REGRESSION_WEIGHT) + LEAGUE_AVG_TOTAL * REGRESSION_WEIGHT
+    return min(max(reg, MIN_FALLBACK_TOTAL), MAX_FALLBACK_TOTAL)
 
-def prob_over(proj, line):
-    z = (proj - line) / TOTAL_STD_DEV
+def prob_over(p, l):
+    z = (p - l) / TOTAL_STD_DEV
     return 0.5 * (1 + math.erf(z / math.sqrt(2)))
 
-# ============================================================
-# UI CONTROLS
-# ============================================================
-st.title("🏀 College Basketball Predictive Betting Model")
-
-min_prob = st.slider("Minimum Probability (%)", 50, 65, 55)
-min_edge = st.slider("Minimum Edge (pts)", 1.0, 6.0, 2.0)
+def kelly(prob, edge):
+    raw = ((prob * (edge / TOTAL_STD_DEV)) - (1 - prob)) * KELLY_FRACTION
+    return min(max(raw * 100, 0), MAX_STAKE_PCT)
 
 # ============================================================
-# TODAY'S SLATE
+# UI
 # ============================================================
-st.subheader("📅 Today’s Games")
+st.title("🏀 College Basketball Totals Model")
 
+min_prob = st.slider("Min Probability (%)", 50, 65, 55)
+min_edge = st.slider("Min Edge (pts)", 1.0, 6.0, 2.0)
+
+# ============================================================
+# SLATE
+# ============================================================
 rows = []
 
 for g in games:
-    home_id = g.get("HomeTeamID")
-    away_id = g.get("AwayTeamID")
-
-    if home_id not in TEAM or away_id not in TEAM:
+    h = g.get("HomeTeamID")
+    a = g.get("AwayTeamID")
+    if h not in TEAM or a not in TEAM:
         continue
 
-    proj = projected_total(home_id, away_id)
+    proj = projected_total(h, a)
     market = g.get("OverUnder")
 
-    if market is not None and VALID_TOTAL_RANGE[0] <= market <= VALID_TOTAL_RANGE[1]:
+    if market and VALID_TOTAL_RANGE[0] <= market <= VALID_TOTAL_RANGE[1]:
         line = float(market)
         source = "Market"
+        adj_prob = min_prob
+        adj_edge = min_edge
     else:
         line = fallback_total(proj)
         source = "Fallback"
+        adj_prob = min_prob + 3
+        adj_edge = min_edge + 1
 
-    edge = proj - line
     p_over = prob_over(proj, line)
-    prob = max(p_over, 1 - p_over)
+    p_under = 1 - p_over
 
-    decision = (
-        "BET" if source == "Market"
-        and prob * 100 >= min_prob
-        and abs(edge) >= min_edge
-        else "PASS"
-    )
+    edge_over = proj - line
+    edge_under = -edge_over
+
+    if p_over >= p_under:
+        side = "OVER"
+        prob = p_over
+        edge = edge_over
+    else:
+        side = "UNDER"
+        prob = p_under
+        edge = edge_under
+
+    decision = "BET" if prob * 100 >= adj_prob and abs(edge) >= adj_edge else "PASS"
+
+    stars = "⭐⭐⭐" if prob >= 0.6 else "⭐⭐" if prob >= 0.57 else "⭐"
+    stake = kelly(prob, abs(edge))
 
     rows.append({
-        "Game": f"{TEAM_NAME[away_id]} @ {TEAM_NAME[home_id]}",
-        "Line Used": round(line, 1),
-        "Line Source": source,
-        "Projected Total": round(proj, 1),
+        "Game": f"{NAME[a]} @ {NAME[h]}",
+        "Side": side,
+        "Line": round(line, 1),
+        "Source": source,
+        "Proj Total": round(proj, 1),
         "Edge": round(edge, 1),
         "Prob %": round(prob * 100, 1),
+        "Confidence": stars,
+        "Stake %": round(stake, 2),
         "Decision": decision
     })
 
-df = pd.DataFrame(rows)
-st.dataframe(df.sort_values("Edge", ascending=False), use_container_width=True)
-
-# ============================================================
-# ROI + CLV TRACKING
-# ============================================================
-st.subheader("📈 Performance & CLV Tracking")
-
-for i, row in df[df["Decision"] == "BET"].iterrows():
-    game = row["Game"]
-    open_line = row["Line Used"]
-
-    if game in st.session_state.graded_games:
-        continue
-
-    close_line = st.number_input(
-        f"{game} – Closing Line",
-        min_value=120.0,
-        max_value=170.0,
-        step=0.5,
-        key=f"cl_{i}"
-    )
-
-    result = st.selectbox(
-        f"{game} – Result",
-        ["Pending", "Win", "Loss"],
-        key=f"res_{i}"
-    )
-
-    if result in ["Win", "Loss"] and close_line > 0:
-        st.session_state.graded_games.add(game)
-        st.session_state.bet_log.append(1 if result == "Win" else -1)
-        st.session_state.clv_log.append(open_line - close_line)
-
-# ============================================================
-# METRICS
-# ============================================================
-total = len(st.session_state.bet_log)
-wins = st.session_state.bet_log.count(1)
-losses = st.session_state.bet_log.count(-1)
-units = sum(st.session_state.bet_log)
-avg_clv = round(sum(st.session_state.clv_log) / len(st.session_state.clv_log), 2) if st.session_state.clv_log else 0
-
-st.metric("Total Bets", total)
-st.metric("Wins", wins)
-st.metric("Losses", losses)
-st.metric("Units", units)
-st.metric("ROI %", round((units / total) * 100, 2) if total else 0)
-st.metric("Avg CLV (pts)", avg_clv)
+df = pd.DataFrame(rows).sort_values("Edge", ascending=False)
+st.dataframe(df, use_container_width=True)
