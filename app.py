@@ -73,10 +73,12 @@ for i, row in final_df.iterrows():
         col1.write(row["Game"])
 
         if col2.button("WIN", key=f"win_{i}"):
-            st.session_state.bet_log.append(1)
+    bet_history.loc[len(bet_history)] = [1]
+    bet_history.to_csv(BET_FILE, index=False)
 
-        if col3.button("LOSS", key=f"loss_{i}"):
-            st.session_state.bet_log.append(-1) 
+if col3.button("LOSS", key=f"loss_{i}"):
+    bet_history.loc[len(bet_history)] = [-1]
+    bet_history.to_csv(BET_FILE, index=False)
 st.subheader("📈 Performance Summary")
 
 total_bets = len(st.session_state.bet_log)
