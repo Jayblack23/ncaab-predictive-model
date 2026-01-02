@@ -35,7 +35,7 @@ KELLY_FRACTION = 0.5
 MAX_STAKE_PCT = 5.0
 
 # ============================================================
-# LOAD TEAM STATS (SAFE)
+# LOAD TEAM STATS (SPORTSDATAIO — SAFE)
 # ============================================================
 @st.cache_data(ttl=86400)
 def load_team_stats():
@@ -51,7 +51,6 @@ def load_team_stats():
         pts = t.get("Points")
         opp_ppg = t.get("OpponentPointsPerGame")
 
-        # Skip teams with incomplete data
         if not g or not pts or not opp_ppg:
             continue
 
@@ -191,7 +190,7 @@ for g in games:
 
     decision = "BET" if (prob >= AUTO_BET_PROB and edge >= AUTO_BET_EDGE) else "PASS"
 
-    stars = "⭐⭐⭐" if prob >= 0.62 else "⭐⭐" if prob >= 0.58 else "⭐"
+    confidence = "⭐⭐⭐" if prob >= 0.62 else "⭐⭐" if prob >= 0.58 else "⭐"
     stake_pct = kelly(prob)
     stake_amt = round(st.session_state.bankroll * stake_pct / 100, 2)
 
@@ -203,13 +202,23 @@ for g in games:
         "Projected Total": round(proj, 1),
         "Edge": round(edge, 1),
         "Prob %": round(prob * 100, 1),
-        "Confidence": stars,
+        "Confidence": confidence,
         "Stake $": stake_amt,
         "Decision": decision
     })
 
-df = pd.DataFrame(rows).sort_values("Edge", ascending=False)
-st.dataframe(df, use_container_width=True)
+# ============================================================
+# DISPLAY RESULTS (SAFE)
+# ============================================================
+if len(rows) == 0:
+    st.warning("No valid games available yet. Betting lines may not be posted.")
+else:
+    df = pd.DataFrame(rows)
+
+    if "Edge" in df.columns:
+        df = df.sort_values("Edge", ascending=False)
+
+    st.dataframe(df, use_container_width=True)
 
 # ============================================================
 # ROI SUMMARY
