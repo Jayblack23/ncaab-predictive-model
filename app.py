@@ -14,21 +14,17 @@ ODDS_API_KEY = st.secrets["ODDS_API_KEY"]
 
 SEASON = "2025"
 
-MIN_POSSESSIONS = 62
-MIN_EFF = 85
-
-PACE_MULTIPLIER = 1.05     # tempo inflation (critical)
-OFF_WEIGHT = 0.6           # offense weighted more than defense
-
 CONF_THRESHOLD = 0.60
 EDGE_THRESHOLD = 3.0
 BANKROLL = 100.0
 
+MIN_GAME_POSSESSIONS = 68  # critical fix
+
 # ============================================================
-# TEAM NAME NORMALIZATION + ALIASES
+# TEAM NAME NORMALIZATION
 # ============================================================
 
-TEAM_ALIASES = {
+ALIASES = {
     "ole miss": "mississippi",
     "uconn": "connecticut",
     "st marys": "saint marys",
@@ -37,25 +33,21 @@ TEAM_ALIASES = {
     "uva": "virginia",
 }
 
-def normalize(name: str) -> str:
+def normalize(name):
     if not name:
         return ""
-    n = (
+    name = (
         name.lower()
         .replace("&", "and")
         .replace(".", "")
         .replace("'", "")
-        .replace("state", "st")
-        .replace("saint", "saint")
         .strip()
     )
-    return TEAM_ALIASES.get(n, n)
+    return ALIASES.get(name, name)
 
-def resolve_team(name, TEAM):
-    if name in TEAM:
-        return name
-    for t in TEAM:
-        if name in t or t in name:
+def resolve(name, teams):
+    for t in teams:
+        if name == t or name in t or t in name:
             return t
     return None
 
@@ -67,12 +59,11 @@ def resolve_team(name, TEAM):
 def load_team_stats():
     url = f"https://api.sportsdata.io/v3/cbb/stats/json/TeamSeasonStats/{SEASON}"
     headers = {"Ocp-Apim-Subscription-Key": SPORTSDATAIO_KEY}
-    r = requests.get(url, headers=headers)
-    r.raise_for_status()
+    data = requests.get(url, headers=headers).json()
 
     teams = {}
 
-    for t in r.json():
+    for t in data:
         g = t.get("Games", 0)
         if g == 0:
             continue
@@ -83,21 +74,23 @@ def load_team_stats():
         tov = t.get("Turnovers", 0)
 
         poss = (fga - orb + tov + 0.44 * fta) / g
-        poss = max(poss, MIN_POSSESSIONS)
 
-        off_rtg = (t.get("Points", 0) / g) / poss * 100
-        def_rtg = (t.get("OpponentPointsPerGame", 0)) / poss * 100
+        off_ppg = t.get("PointsPerGame", 0)
+        opp_ppg = t.get("OpponentPointsPerGame", 0)
+
+        off_rtg = (off_ppg / poss) * 100 if poss > 0 else 100
+        def_rtg = (opp_ppg / poss) * 100 if poss > 0 else 100
 
         teams[normalize(t["Name"])] = {
             "poss": poss,
-            "off": max(off_rtg, MIN_EFF),
-            "def": max(def_rtg, MIN_EFF),
+            "off": off_rtg,
+            "def": def_rtg,
         }
 
     return teams
 
 # ============================================================
-# LOAD ODDS (CONSENSUS TOTALS)
+# LOAD ODDS (ODDS API)
 # ============================================================
 
 @st.cache_data(ttl=300)
@@ -109,41 +102,30 @@ def load_odds():
         "markets": "totals",
         "oddsFormat": "american",
     }
-    r = requests.get(url, params=params)
-    r.raise_for_status()
-    return r.json()
+    return requests.get(url, params=params).json()
 
 # ============================================================
-# MODEL (CALIBRATED)
+# CORE MODEL (FIXED)
 # ============================================================
 
 def projected_total(home, away, TEAM):
     h = TEAM[home]
     a = TEAM[away]
 
-    # Pace inflation
-    pace = ((h["poss"] + a["poss"]) / 2) * PACE_MULTIPLIER
+    # Realistic NCAA game possessions
+    possessions = max((h["poss"] + a["poss"]) / 2, MIN_GAME_POSSESSIONS)
 
-    # Offense-weighted efficiency
-    home_eff = (OFF_WEIGHT * h["off"] + (1 - OFF_WEIGHT) * a["def"])
-    away_eff = (OFF_WEIGHT * a["off"] + (1 - OFF_WEIGHT) * h["def"])
+    # Convert ratings to PPP
+    home_ppp = ((h["off"] / 100) + (1 - a["def"] / 100)) / 2
+    away_ppp = ((a["off"] / 100) + (1 - h["def"] / 100)) / 2
 
-    home_pts = pace * home_eff / 100
-    away_pts = pace * away_eff / 100
-
-    return round(home_pts + away_pts, 1)
+    total = possessions * (home_ppp + away_ppp)
+    return round(total, 1)
 
 def prob_over(proj, line):
     std = 11
     z = (proj - line) / std
-    return round(0.5 * (1 + math.erf(z / math.sqrt(2))), 3)
-
-# ============================================================
-# SESSION STATE
-# ============================================================
-
-if "bet_log" not in st.session_state:
-    st.session_state.bet_log = []
+    return 0.5 * (1 + math.erf(z / math.sqrt(2)))
 
 # ============================================================
 # UI
@@ -157,29 +139,27 @@ ODDS = load_odds()
 rows = []
 
 for g in ODDS:
-    home_raw = normalize(g.get("home_team", ""))
-    away_raw = normalize(g.get("away_team", ""))
+    home_raw = normalize(g.get("home_team"))
+    away_raw = normalize(g.get("away_team"))
 
-    home = resolve_team(home_raw, TEAM)
-    away = resolve_team(away_raw, TEAM)
+    home = resolve(home_raw, TEAM)
+    away = resolve(away_raw, TEAM)
 
     if not home or not away:
         continue
 
-    # ---- Consensus Market Total ----
-    lines = []
+    totals = []
     for b in g.get("bookmakers", []):
         for m in b.get("markets", []):
             if m.get("key") == "totals":
                 for o in m.get("outcomes", []):
                     if o.get("name") == "Over" and isinstance(o.get("point"), (int, float)):
-                        lines.append(o["point"])
+                        totals.append(o["point"])
 
-    if not lines:
+    if not totals:
         continue
 
-    market_total = round(sum(lines) / len(lines), 1)
-
+    market_total = round(sum(totals) / len(totals), 1)
     proj = projected_total(home, away, TEAM)
     edge = round(proj - market_total, 2)
     prob = prob_over(proj, market_total)
@@ -192,8 +172,6 @@ for g in ODDS:
         "⭐"
     )
 
-    stake = round(BANKROLL * 0.01, 2) if decision == "BET" else 0
-
     rows.append({
         "Game": f"{g['away_team']} @ {g['home_team']}",
         "Market Total": market_total,
@@ -202,7 +180,6 @@ for g in ODDS:
         "Probability %": round(prob * 100, 1),
         "Confidence": confidence,
         "Decision": decision,
-        "Stake": stake
     })
 
 # ============================================================
@@ -214,24 +191,3 @@ if not rows:
 else:
     df = pd.DataFrame(rows).sort_values("Edge", ascending=False)
     st.dataframe(df, use_container_width=True)
-
-# ============================================================
-# ROI / PERFORMANCE
-# ============================================================
-
-st.subheader("📈 Performance Summary")
-
-total_bets = len(st.session_state.bet_log)
-wins = st.session_state.bet_log.count(1)
-losses = st.session_state.bet_log.count(-1)
-units = sum(st.session_state.bet_log)
-
-roi = round((units / total_bets) * 100, 2) if total_bets > 0 else 0
-win_pct = round((wins / total_bets) * 100, 2) if total_bets > 0 else 0
-
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Bets", total_bets)
-c2.metric("Wins", wins)
-c3.metric("Losses", losses)
-c4.metric("Units", units)
-c5.metric("ROI %", roi)
