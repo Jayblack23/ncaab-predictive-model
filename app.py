@@ -15,17 +15,18 @@ st.set_page_config(page_title="NCAAB Predictive Model", layout="wide")
 if "bet_log" not in st.session_state:
     st.session_state.bet_log = []
 
-if "bets" not in st.session_state:
-    st.session_state.bets = []
+if "graded_bets" not in st.session_state:
+    st.session_state.graded_bets = set()
 
 # ============================================================
 # CONSTANTS
 # ============================================================
 TOTAL_STD_DEV = 11.5
 REGRESSION_WEIGHT = 0.12
+LEAGUE_AVG_TOTAL = 145
 
 # ============================================================
-# LOAD TEAM STATS (RAW DATA — NO FAKE METRICS)
+# LOAD TEAM STATS (SPORTSDATAIO – CORRECT SCHEMA)
 # ============================================================
 @st.cache_data(ttl=86400)
 def load_teams():
@@ -35,19 +36,26 @@ def load_teams():
 
     teams = []
     for t in r.json():
-        if t["Games"] == 0:
+        games = t.get("Games", 0)
+        if games == 0:
             continue
 
         teams.append({
             "TeamID": t["TeamID"],
             "Name": t["Name"],
-            "Games": t["Games"],
-            "Points": t["Points"],
-            "PointsAllowed": t["OpponentPoints"],
-            "FGA": t["FieldGoalsAttempted"],
-            "FTA": t["FreeThrowsAttempted"],
-            "ORB": t["OffensiveRebounds"],
-            "TOV": t["Turnovers"]
+            "Games": games,
+
+            # Season totals
+            "Points": t.get("Points", 0),
+
+            # NCAAB uses OpponentPointsPerGame
+            "PointsAllowed": t.get("OpponentPointsPerGame", 0) * games,
+
+            # Possession components
+            "FGA": t.get("FieldGoalsAttempted", 0),
+            "FTA": t.get("FreeThrowsAttempted", 0),
+            "ORB": t.get("OffensiveRebounds", 0),
+            "TOV": t.get("Turnovers", 0),
         })
 
     return pd.DataFrame(teams)
@@ -79,31 +87,33 @@ def estimate_possessions(team):
         + team["TOV"]
         + 0.44 * team["FTA"]
     ) / team["Games"]
-    return max(poss, 60)  # floor to avoid extreme outliers
+
+    return max(poss, 60)
 
 def team_ratings(team):
     poss = estimate_possessions(team)
+
     ortg = (team["Points"] / team["Games"]) / poss * 100
     drtg = (team["PointsAllowed"] / team["Games"]) / poss * 100
+
     return poss, ortg, drtg
 
 def projected_total(home_id, away_id):
     home = TEAM[home_id]
     away = TEAM[away_id]
 
-    home_poss, home_ortg, home_drtg = team_ratings(home)
-    away_poss, away_ortg, away_drtg = team_ratings(away)
+    h_poss, h_ortg, h_drtg = team_ratings(home)
+    a_poss, a_ortg, a_drtg = team_ratings(away)
 
-    possessions = (home_poss + away_poss) / 2
+    possessions = (h_poss + a_poss) / 2
 
-    home_pts = possessions * (home_ortg / away_drtg)
-    away_pts = possessions * (away_ortg / home_drtg)
+    home_pts = possessions * (h_ortg / a_drtg)
+    away_pts = possessions * (a_ortg / h_drtg)
 
     return home_pts + away_pts
 
 def fallback_total(proj):
-    league_avg = 145
-    return proj * (1 - REGRESSION_WEIGHT) + league_avg * REGRESSION_WEIGHT
+    return proj * (1 - REGRESSION_WEIGHT) + LEAGUE_AVG_TOTAL * REGRESSION_WEIGHT
 
 def prob_over(proj, line):
     z = (proj - line) / TOTAL_STD_DEV
@@ -112,10 +122,10 @@ def prob_over(proj, line):
 # ============================================================
 # UI CONTROLS
 # ============================================================
-st.title("🏀 College Basketball Predictive Model")
+st.title("🏀 College Basketball Predictive Betting Model")
 
-min_prob = st.slider("Min Probability (%)", 50, 65, 55)
-min_edge = st.slider("Min Edge (pts)", 1.0, 6.0, 2.0)
+min_prob = st.slider("Minimum Probability (%)", 50, 65, 55)
+min_edge = st.slider("Minimum Edge (pts)", 1.0, 6.0, 2.0)
 
 # ============================================================
 # MANUAL MATCHUP TOOL
@@ -180,7 +190,7 @@ for g in games:
 
     rows.append({
         "Game": f"{TEAM_NAME[away_id]} @ {TEAM_NAME[home_id]}",
-        "Market/Fallback Line": round(line, 1),
+        "Line Used": round(line, 1),
         "Line Source": source,
         "Projected Total": round(proj, 1),
         "Edge": round(edge, 1),
@@ -189,22 +199,31 @@ for g in games:
     })
 
 df = pd.DataFrame(rows)
-
 st.dataframe(df.sort_values("Edge", ascending=False), use_container_width=True)
 st.caption(f"Games displayed: {len(df)}")
 
 # ============================================================
-# ROI TRACKING
+# ROI TRACKING (SAFE – NO DUPLICATION)
 # ============================================================
 st.subheader("📈 Performance Summary")
 
-if st.session_state.bets:
-    for i, bet in enumerate(st.session_state.bets):
-        result = st.selectbox(bet, ["Pending", "Win", "Loss"], key=f"res_{i}")
-        if result == "Win":
-            st.session_state.bet_log.append(1)
-        elif result == "Loss":
-            st.session_state.bet_log.append(-1)
+for i, row in df[df["Decision"] == "BET"].iterrows():
+    bet_id = row["Game"]
+    if bet_id in st.session_state.graded_bets:
+        continue
+
+    result = st.selectbox(
+        f"{bet_id}",
+        ["Pending", "Win", "Loss"],
+        key=f"grade_{i}"
+    )
+
+    if result == "Win":
+        st.session_state.bet_log.append(1)
+        st.session_state.graded_bets.add(bet_id)
+    elif result == "Loss":
+        st.session_state.bet_log.append(-1)
+        st.session_state.graded_bets.add(bet_id)
 
 total = len(st.session_state.bet_log)
 wins = st.session_state.bet_log.count(1)
