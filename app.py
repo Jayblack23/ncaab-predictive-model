@@ -21,13 +21,11 @@ if "bets" not in st.session_state:
 # ============================================================
 # CONSTANTS
 # ============================================================
-LEAGUE_AVG_TEMPO = 68
-LEAGUE_AVG_EFF = 102
 TOTAL_STD_DEV = 11.5
-REGRESSION_WEIGHT = 0.12  # light KenPom-style regression
+REGRESSION_WEIGHT = 0.12
 
 # ============================================================
-# LOAD TEAM METRICS (TeamID-based)
+# LOAD TEAM STATS (RAW DATA — NO FAKE METRICS)
 # ============================================================
 @st.cache_data(ttl=86400)
 def load_teams():
@@ -35,17 +33,24 @@ def load_teams():
     url = "https://api.sportsdata.io/v3/cbb/stats/json/TeamSeasonStats/2025"
     r = requests.get(url, headers=headers)
 
-    rows = []
+    teams = []
     for t in r.json():
-        rows.append({
+        if t["Games"] == 0:
+            continue
+
+        teams.append({
             "TeamID": t["TeamID"],
             "Name": t["Name"],
-            "Tempo": t.get("PossessionsPerGame", LEAGUE_AVG_TEMPO),
-            "OE": t.get("OffensiveEfficiency", LEAGUE_AVG_EFF),
-            "DE": t.get("DefensiveEfficiency", LEAGUE_AVG_EFF)
+            "Games": t["Games"],
+            "Points": t["Points"],
+            "PointsAllowed": t["OpponentPoints"],
+            "FGA": t["FieldGoalsAttempted"],
+            "FTA": t["FreeThrowsAttempted"],
+            "ORB": t["OffensiveRebounds"],
+            "TOV": t["Turnovers"]
         })
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(teams)
 
 teams_df = load_teams()
 TEAM = teams_df.set_index("TeamID").to_dict("index")
@@ -65,27 +70,40 @@ def load_games():
 games = load_games()
 
 # ============================================================
-# MODEL CORE (FIXED)
+# MODEL CORE (DERIVED POSSESSIONS)
 # ============================================================
-def expected_points(possessions, off_eff, def_eff):
-    return possessions * (off_eff / def_eff)
+def estimate_possessions(team):
+    poss = (
+        team["FGA"]
+        - team["ORB"]
+        + team["TOV"]
+        + 0.44 * team["FTA"]
+    ) / team["Games"]
+    return max(poss, 60)  # floor to avoid extreme outliers
+
+def team_ratings(team):
+    poss = estimate_possessions(team)
+    ortg = (team["Points"] / team["Games"]) / poss * 100
+    drtg = (team["PointsAllowed"] / team["Games"]) / poss * 100
+    return poss, ortg, drtg
 
 def projected_total(home_id, away_id):
-    A = TEAM[home_id]
-    B = TEAM[away_id]
+    home = TEAM[home_id]
+    away = TEAM[away_id]
 
-    # TRUE blended tempo (NO forced normalization)
-    possessions = (A["Tempo"] + B["Tempo"]) / 2
+    home_poss, home_ortg, home_drtg = team_ratings(home)
+    away_poss, away_ortg, away_drtg = team_ratings(away)
 
-    home_pts = expected_points(possessions, A["OE"], B["DE"])
-    away_pts = expected_points(possessions, B["OE"], A["DE"])
+    possessions = (home_poss + away_poss) / 2
+
+    home_pts = possessions * (home_ortg / away_drtg)
+    away_pts = possessions * (away_ortg / home_drtg)
 
     return home_pts + away_pts
 
-def kenpom_fallback(proj):
-    # Regress slightly toward league mean TOTAL (~145)
-    league_mean_total = LEAGUE_AVG_TEMPO * (LEAGUE_AVG_EFF / LEAGUE_AVG_EFF) * 2
-    return proj * (1 - REGRESSION_WEIGHT) + league_mean_total * REGRESSION_WEIGHT
+def fallback_total(proj):
+    league_avg = 145
+    return proj * (1 - REGRESSION_WEIGHT) + league_avg * REGRESSION_WEIGHT
 
 def prob_over(proj, line):
     z = (proj - line) / TOTAL_STD_DEV
@@ -94,7 +112,7 @@ def prob_over(proj, line):
 # ============================================================
 # UI CONTROLS
 # ============================================================
-st.title("🏀 College Basketball Predictive Betting Model")
+st.title("🏀 College Basketball Predictive Model")
 
 min_prob = st.slider("Min Probability (%)", 50, 65, 55)
 min_edge = st.slider("Min Edge (pts)", 1.0, 6.0, 2.0)
@@ -116,8 +134,7 @@ with c3:
 
 if st.button("Project Matchup"):
     proj = projected_total(home_id, away_id)
-    fallback = kenpom_fallback(proj)
-    line = manual_total if manual_total > 0 else fallback
+    line = manual_total if manual_total > 0 else fallback_total(proj)
     edge = proj - line
     prob = prob_over(proj, line)
 
@@ -141,14 +158,13 @@ for g in games:
         continue
 
     proj = projected_total(home_id, away_id)
-    fallback = kenpom_fallback(proj)
-
     market = g.get("OverUnder")
+
     if market not in (None, 0):
         line = float(market)
         source = "Market"
     else:
-        line = fallback
+        line = fallback_total(proj)
         source = "Fallback"
 
     edge = proj - line
@@ -164,16 +180,18 @@ for g in games:
 
     rows.append({
         "Game": f"{TEAM_NAME[away_id]} @ {TEAM_NAME[home_id]}",
-        "Line Used": round(line, 2),
+        "Market/Fallback Line": round(line, 1),
         "Line Source": source,
-        "Projected Total": round(proj, 2),
-        "Edge": round(edge, 2),
+        "Projected Total": round(proj, 1),
+        "Edge": round(edge, 1),
         "Prob %": round(prob * 100, 1),
         "Decision": decision
     })
 
 df = pd.DataFrame(rows)
+
 st.dataframe(df.sort_values("Edge", ascending=False), use_container_width=True)
+st.caption(f"Games displayed: {len(df)}")
 
 # ============================================================
 # ROI TRACKING
