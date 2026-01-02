@@ -7,7 +7,7 @@ import requests
 import math
 from datetime import date
 
-st.set_page_config(page_title="NCAAB Totals Model", layout="wide")
+st.set_page_config(page_title="NCAAB Totals Betting Model", layout="wide")
 
 # ============================================================
 # SESSION STATE
@@ -35,7 +35,7 @@ KELLY_FRACTION = 0.5
 MAX_STAKE_PCT = 5.0
 
 # ============================================================
-# LOAD TEAM STATS (SPORTSDATAIO)
+# LOAD TEAM STATS (SPORTSDATAIO — FIXED SCHEMA)
 # ============================================================
 @st.cache_data(ttl=86400)
 def load_team_stats():
@@ -56,11 +56,13 @@ def load_team_stats():
         orb = t.get("OffensiveRebounds", 0)
         tov = t.get("Turnovers", 0)
 
+        # Possessions per game
         poss = (fga - orb + tov + 0.44 * fta) / g
         poss = max(poss, MIN_POSSESSIONS)
 
+        # Ratings (CORRECT FIELDS)
         off_rtg = (t["Points"] / g) / poss * 100
-        def_rtg = (t["OpponentPoints"] / g) / poss * 100
+        def_rtg = (t["OpponentPointsPerGame"]) / poss * 100
 
         teams[t["TeamID"]] = {
             "poss": poss,
@@ -117,7 +119,7 @@ for g in odds_raw:
                     break
 
 # ============================================================
-# MODEL FUNCTIONS (FIXED)
+# MODEL FUNCTIONS (CORRECT PPP MATH)
 # ============================================================
 def projected_total(home_id, away_id):
     h = TEAM[home_id]
@@ -128,8 +130,7 @@ def projected_total(home_id, away_id):
     home_ppp = (h["off"] + a["def"]) / 200
     away_ppp = (a["off"] + h["def"]) / 200
 
-    total = poss * (home_ppp + away_ppp)
-    return total
+    return poss * (home_ppp + away_ppp)
 
 def prob_over(projected, line):
     z = (projected - line) / TOTAL_STD
@@ -140,16 +141,16 @@ def kelly(prob):
     return min(max(raw * 100, 0), MAX_STAKE_PCT)
 
 # ============================================================
-# UI
+# UI CONTROLS
 # ============================================================
-st.title("🏀 College Basketball Totals Model")
+st.title("🏀 College Basketball Totals Betting Model")
 
 st.session_state.bankroll = st.number_input(
-    "Bankroll ($)", 10.0, value=st.session_state.bankroll, step=10.0
+    "Bankroll ($)", min_value=10.0, value=st.session_state.bankroll, step=10.0
 )
 
-min_prob = st.slider("Min Probability %", 50, 65, 55)
-min_edge = st.slider("Min Edge (pts)", 1.0, 6.0, 2.0)
+min_prob = st.slider("Minimum Probability %", 50, 65, 55)
+min_edge = st.slider("Minimum Edge (pts)", 1.0, 6.0, 2.0)
 
 # ============================================================
 # BUILD SLATE
@@ -183,7 +184,11 @@ for g in games:
         prob = p_under
         edge = line - proj
 
-    decision = "BET" if (prob >= AUTO_BET_PROB and edge >= AUTO_BET_EDGE) else "PASS"
+    decision = (
+        "BET"
+        if prob >= AUTO_BET_PROB and edge >= AUTO_BET_EDGE
+        else "PASS"
+    )
 
     stars = "⭐⭐⭐" if prob >= 0.62 else "⭐⭐" if prob >= 0.58 else "⭐"
 
@@ -195,7 +200,7 @@ for g in games:
         "Side": side,
         "Line": round(line, 1),
         "Line Source": source,
-        "Projected": round(proj, 1),
+        "Projected Total": round(proj, 1),
         "Edge": round(edge, 1),
         "Prob %": round(prob * 100, 1),
         "Confidence": stars,
