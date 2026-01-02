@@ -7,23 +7,25 @@ import requests
 import math
 from datetime import date
 
-st.set_page_config(page_title="NCAAB Totals Model", layout="wide")
+st.set_page_config(page_title="NCAAB Betting Model", layout="wide")
 
 # ============================================================
 # MODEL CONSTANTS
 # ============================================================
 LEAGUE_AVG_TEMPO = 68
 LEAGUE_AVG_EFF = 102
-TOTAL_STD_DEV = 11.5   # realistic NCAAB totals variance
+TOTAL_STD_DEV = 11.5
+MARKET_CALIBRATION_WEIGHT = 0.25  # pulls projections toward market
 
 # ============================================================
-# SESSION STATE (ROI PERSISTENCE)
+# SESSION STATE (PERSISTENCE)
 # ============================================================
-if "bet_log" not in st.session_state:
-    st.session_state.bet_log = []
+for key in ["bet_log", "clv_log"]:
+    if key not in st.session_state:
+        st.session_state[key] = []
 
 # ============================================================
-# SPORTSDATAIO — TEAM METRICS (2025 SEASON)
+# SPORTSDATAIO — TEAM METRICS (2025)
 # ============================================================
 @st.cache_data(ttl=86400)
 def fetch_team_metrics():
@@ -31,21 +33,15 @@ def fetch_team_metrics():
         "Ocp-Apim-Subscription-Key": st.secrets["SPORTSDATAIO_API_KEY"]
     }
 
-    # IMPORTANT: SportsDataIO uses SEASON END YEAR
-    season = 2025
-    url = f"https://api.sportsdata.io/v3/cbb/stats/json/TeamSeasonStats/{season}"
-
+    url = "https://api.sportsdata.io/v3/cbb/stats/json/TeamSeasonStats/2025"
     r = requests.get(url, headers=headers)
 
     if r.status_code != 200:
         st.error(f"SportsDataIO Error {r.status_code}")
-        st.write(r.text)
         st.stop()
 
-    data = r.json()
-
     rows = []
-    for t in data:
+    for t in r.json():
         rows.append({
             "Team": t["Name"],
             "Tempo": t.get("PossessionsPerGame", LEAGUE_AVG_TEMPO),
@@ -58,98 +54,150 @@ def fetch_team_metrics():
 teams = fetch_team_metrics()
 
 # ============================================================
+# SPORTSDATAIO — TODAY'S GAMES
+# ============================================================
+@st.cache_data(ttl=3600)
+def fetch_todays_games():
+    headers = {
+        "Ocp-Apim-Subscription-Key": st.secrets["SPORTSDATAIO_API_KEY"]
+    }
+
+    today = date.today().strftime("%Y-%m-%d")
+    url = f"https://api.sportsdata.io/v3/cbb/scores/json/GamesByDate/{today}"
+
+    r = requests.get(url, headers=headers)
+    if r.status_code != 200:
+        return []
+
+    return r.json()
+
+games = fetch_todays_games()
+
+# ============================================================
 # MODEL FUNCTIONS
 # ============================================================
 def expected_points(tempo, off_eff, def_eff):
     return tempo * (off_eff / def_eff)
 
-def project_game_total(home, away):
+def project_total(home, away):
     A = teams[teams.Team == home].iloc[0]
     B = teams[teams.Team == away].iloc[0]
 
-    # Average & normalize tempo
     tempo = (A.Tempo + B.Tempo) / 2
     tempo *= LEAGUE_AVG_TEMPO / tempo
 
-    pts_a = expected_points(tempo, A.AdjOE, B.AdjDE)
-    pts_b = expected_points(tempo, B.AdjOE, A.AdjDE)
+    pts = (
+        expected_points(tempo, A.AdjOE, B.AdjDE)
+        + expected_points(tempo, B.AdjOE, A.AdjDE)
+    )
 
-    return pts_a + pts_b
+    return pts
 
-def over_probability(projected, line):
+def prob_over(projected, line):
     z = (projected - line) / TOTAL_STD_DEV
     return 0.5 * (1 + math.erf(z / math.sqrt(2)))
 
-# ============================================================
-# UI — INPUTS
-# ============================================================
-st.title("🏀 College Basketball Totals Model (SportsDataIO)")
-
-team_list = sorted(teams.Team.unique())
-
-c1, c2, c3 = st.columns(3)
-with c1:
-    home = st.selectbox("Home Team", team_list)
-with c2:
-    away = st.selectbox("Away Team", team_list)
-with c3:
-    line = st.number_input("Market Total", value=140.5, step=0.5)
-
-min_prob = st.slider("Minimum Probability (%)", 50, 65, 55)
-min_edge = st.slider("Minimum Edge (Points)", 1.0, 5.0, 2.0)
+def kelly_fraction(prob, odds=-110):
+    b = abs(odds) / 100
+    return max((prob * (b + 1) - 1) / b, 0)
 
 # ============================================================
-# RUN MODEL
+# UI
 # ============================================================
-if home != away:
-    projected = round(project_game_total(home, away), 2)
-    edge = round(projected - line, 2)
-    prob = round(over_probability(projected, line) * 100, 2)
+st.title("🏀 College Basketball Betting Model")
 
-    decision = "BET" if prob >= min_prob and edge >= min_edge else "PASS"
+bankroll = st.number_input("Bankroll ($)", value=1000.0, step=100.0)
+min_prob = st.slider("Min Probability %", 50, 65, 55)
+min_edge = st.slider("Min Edge (pts)", 1.0, 5.0, 2.0)
 
-    st.subheader("📊 Projection")
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Projected Total", projected)
-    m2.metric("Market Line", line)
-    m3.metric("Edge", edge)
-    m4.metric("Over Probability", f"{prob}%")
-    m5.metric("Decision", decision)
+st.subheader("📅 Today’s Games")
+
+rows = []
+
+for g in games:
+    try:
+        home = g["HomeTeam"]
+        away = g["AwayTeam"]
+        market_total = g["OverUnder"]
+
+        if market_total is None:
+            continue
+
+        raw_proj = project_total(home, away)
+
+        # Market calibration
+        proj = (
+            raw_proj * (1 - MARKET_CALIBRATION_WEIGHT)
+            + market_total * MARKET_CALIBRATION_WEIGHT
+        )
+
+        edge = round(proj - market_total, 2)
+        p_over = prob_over(proj, market_total)
+        p_under = 1 - p_over
+
+        side = "OVER" if edge > 0 else "UNDER"
+        prob = max(p_over, p_under)
+
+        decision = (
+            "BET"
+            if prob * 100 >= min_prob and abs(edge) >= min_edge
+            else "PASS"
+        )
+
+        stake_pct = kelly_fraction(prob)
+        stake = round(bankroll * stake_pct, 2)
+
+        rows.append({
+            "Game": f"{away} @ {home}",
+            "Market": market_total,
+            "Projected": round(proj, 2),
+            "Edge": edge,
+            "Side": side,
+            "Prob %": round(prob * 100, 1),
+            "Kelly $": stake,
+            "Decision": decision
+        })
+
+    except:
+        continue
+
+df = pd.DataFrame(rows).sort_values("Edge", ascending=False)
+st.dataframe(df, use_container_width=True)
 
 # ============================================================
-# BET LOGGING
+# LOG RESULTS + CLV
 # ============================================================
-st.subheader("🧾 Log Bet Result")
+st.subheader("🧾 Log Result")
 
-result = st.radio("Game Outcome", ["Pending", "Win", "Loss"], horizontal=True)
+col1, col2, col3 = st.columns(3)
 
-if st.button("Save Result"):
-    if result == "Win":
-        st.session_state.bet_log.append(1)
-    elif result == "Loss":
-        st.session_state.bet_log.append(-1)
+with col1:
+    result = st.selectbox("Result", ["Win", "Loss"])
+with col2:
+    open_line = st.number_input("Open Line", step=0.5)
+with col3:
+    close_line = st.number_input("Close Line", step=0.5)
+
+if st.button("Save Bet"):
+    st.session_state.bet_log.append(1 if result == "Win" else -1)
+    st.session_state.clv_log.append(open_line - close_line)
 
 # ============================================================
-# ROI SUMMARY
+# PERFORMANCE SUMMARY
 # ============================================================
 st.subheader("📈 Performance Summary")
 
-total_bets = len(st.session_state.bet_log)
-wins = st.session_state.bet_log.count(1)
-losses = st.session_state.bet_log.count(-1)
+bets = len(st.session_state.bet_log)
 units = sum(st.session_state.bet_log)
+roi = round((units / bets) * 100, 2) if bets else 0
+avg_clv = round(
+    sum(st.session_state.clv_log) / len(st.session_state.clv_log), 2
+) if st.session_state.clv_log else 0
 
-roi = round((units / total_bets) * 100, 2) if total_bets else 0
-win_pct = round((wins / total_bets) * 100, 2) if total_bets else 0
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Bets", bets)
+c2.metric("Units", units)
+c3.metric("ROI %", roi)
+c4.metric("Avg CLV", avg_clv)
 
-r1, r2, r3, r4, r5 = st.columns(5)
-r1.metric("Total Bets", total_bets)
-r2.metric("Wins", wins)
-r3.metric("Losses", losses)
-r4.metric("Units", units)
-r5.metric("ROI %", roi)
-
-# ============================================================
-# FOOTER
-# ============================================================
-st.caption(f"Updated {date.today()} | Data Source: SportsDataIO | Season: 2025")
+st.caption("Data: SportsDataIO · Model for informational use only")
