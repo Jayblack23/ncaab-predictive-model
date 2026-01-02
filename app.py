@@ -4,268 +4,147 @@
 import streamlit as st
 import pandas as pd
 import requests
-import os
-from math import erf, sqrt
-from datetime import datetime
-import numpy as np
+import math
+from datetime import date
+
+st.set_page_config(page_title="NCAAB Totals Model", layout="wide")
 
 # ============================================================
-# PAGE CONFIG
+# CONSTANTS (MODEL CONTROLS)
 # ============================================================
-st.set_page_config(
-    page_title="NCAAB Totals Model",
-    layout="wide"
-)
-
-# ============================================================
-# CONSTANTS
-# ============================================================
-BANKROLL = 1000
-ODDS = -110
-DATA_DIR = "data"
-os.makedirs(DATA_DIR, exist_ok=True)
-
-BET_LOG_FILE = f"{DATA_DIR}/bet_log.csv"
-LINE_HISTORY_FILE = f"{DATA_DIR}/line_history.csv"
+LEAGUE_AVG_TEMPO = 68
+LEAGUE_AVG_EFF = 102
+TOTAL_STD_DEV = 11.5   # empirically reasonable for NCAAB totals
 
 # ============================================================
-# INITIALIZE STORAGE
+# SESSION STATE (ROI PERSISTENCE)
 # ============================================================
-if not os.path.exists(BET_LOG_FILE):
-    pd.DataFrame(columns=[
-        "Game","Side","Bet_Line",
-        "Prob","Edge","Units","Result","Date"
-    ]).to_csv(BET_LOG_FILE, index=False)
-
-if not os.path.exists(LINE_HISTORY_FILE):
-    pd.DataFrame(columns=["Game","Line","Time"]).to_csv(
-        LINE_HISTORY_FILE, index=False
-    )
-
-bet_log = pd.read_csv(BET_LOG_FILE)
-line_history = pd.read_csv(LINE_HISTORY_FILE)
+if "bet_log" not in st.session_state:
+    st.session_state.bet_log = []
 
 # ============================================================
-# MATH FUNCTIONS
+# DATA PULL — SPORTSDATAIO (LEGAL)
 # ============================================================
-def normal_cdf(x):
-    return (1 + erf(x / sqrt(2))) / 2
+@st.cache_data(ttl=86400)
+def fetch_team_metrics():
+    headers = {
+        "Ocp-Apim-Subscription-Key": st.secrets["SPORTSDATAIO_API_KEY"]
+    }
 
-def implied_prob(odds):
-    return abs(odds) / (abs(odds) + 100)
+    season = 2024
+    url = f"https://api.sportsdata.io/v3/cbb/stats/json/TeamSeasonStats/{season}"
 
-def prob_over(line, proj, std):
-    return 1 - normal_cdf((line - proj) / std)
-
-def prob_under(line, proj, std):
-    return normal_cdf((line - proj) / std)
-
-def kelly_fraction(p, odds):
-    b = 100 / abs(odds)
-    return max((p*b - (1-p)) / b, 0)
-
-# ============================================================
-# FETCH ODDS
-# ============================================================
-@st.cache_data(ttl=300)
-def fetch_totals():
-    r = requests.get(
-        "https://api.the-odds-api.com/v4/sports/basketball_ncaab/odds",
-        params={
-            "apiKey": st.secrets["ODDS_API_KEY"],
-            "regions": "us",
-            "markets": "totals",
-            "oddsFormat": "american"
-        }
-    )
+    r = requests.get(url, headers=headers)
+    if r.status_code != 200:
+        st.error("SportsDataIO API unavailable")
+        st.stop()
 
     data = r.json()
+
     rows = []
-
-    if not isinstance(data, list):
-        return pd.DataFrame()
-
-    for g in data:
-        try:
-            totals = [
-                o["point"]
-                for b in g["bookmakers"]
-                for o in b["markets"][0]["outcomes"]
-            ]
-
-            rows.append({
-                "Game": f"{g['away_team']} vs {g['home_team']}",
-                "Market_Total": np.mean(totals)
-            })
-        except:
-            continue
+    for t in data:
+        rows.append({
+            "Team": t["Name"],
+            "Tempo": t.get("PossessionsPerGame", LEAGUE_AVG_TEMPO),
+            "AdjOE": t.get("OffensiveEfficiency", LEAGUE_AVG_EFF),
+            "AdjDE": t.get("DefensiveEfficiency", LEAGUE_AVG_EFF)
+        })
 
     return pd.DataFrame(rows)
 
-# ============================================================
-# UI HEADER
-# ============================================================
-st.title("🏀 NCAAB Totals Predictive Model")
-st.caption("Calibrated • Directional • Market-Validated")
-
-if st.button("🔄 Refresh Odds"):
-    st.experimental_rerun()
-
-df = fetch_totals()
-if df.empty:
-    st.error("No odds available.")
-    st.stop()
+teams = fetch_team_metrics()
 
 # ============================================================
-# TEAM METRICS UPLOAD (FEATURE #1)
+# MODEL FUNCTIONS
 # ============================================================
-st.subheader("📂 Upload Team Metrics CSV")
-st.caption("Required columns: Team, Tempo, AdjOE")
+def expected_points(tempo, off_eff, def_eff):
+    return tempo * (off_eff / def_eff)
 
-team_file = st.file_uploader("Upload CSV", type="csv")
-if team_file is None:
-    st.stop()
+def game_projection(team_a, team_b):
+    A = teams[teams.Team == team_a].iloc[0]
+    B = teams[teams.Team == team_b].iloc[0]
 
-teams = pd.read_csv(team_file)
+    tempo = (A.Tempo + B.Tempo) / 2
+    tempo *= LEAGUE_AVG_TEMPO / tempo  # normalization
 
-def team_stat(game, col):
-    away, home = game.split(" vs ")
-    try:
-        return (
-            teams.loc[teams.Team == home, col].values[0],
-            teams.loc[teams.Team == away, col].values[0]
-        )
-    except:
-        return None, None
+    pts_a = expected_points(tempo, A.AdjOE, B.AdjDE)
+    pts_b = expected_points(tempo, B.AdjOE, A.AdjDE)
 
-df["Tempo_H"], df["Tempo_A"] = zip(*df.Game.map(lambda g: team_stat(g,"Tempo")))
-df["OE_H"], df["OE_A"] = zip(*df.Game.map(lambda g: team_stat(g,"AdjOE")))
-df.dropna(inplace=True)
+    return pts_a + pts_b
+
+def over_probability(total, line):
+    z = (total - line) / TOTAL_STD_DEV
+    return 0.5 * (1 + math.erf(z / math.sqrt(2)))
 
 # ============================================================
-# PROJECTION ENGINE
+# UI — INPUTS
 # ============================================================
-df["Tempo"] = (df.Tempo_H + df.Tempo_A) / 2
-df["Raw_Model"] = df.Tempo * (df.OE_H + df.OE_A) / 100
+st.title("🏀 College Basketball Totals Model")
 
-# Market blending
-df["Projection"] = 0.6 * df.Raw_Model + 0.4 * df.Market_Total
+team_list = sorted(teams.Team.unique())
+col1, col2, col3 = st.columns(3)
 
-# Calibration to market
-df["Projection"] -= (df.Projection.mean() - df.Market_Total.mean())
+with col1:
+    home = st.selectbox("Home Team", team_list)
+with col2:
+    away = st.selectbox("Away Team", team_list)
+with col3:
+    line = st.number_input("Total Line", value=140.5, step=0.5)
 
-# ============================================================
-# LATE-SEASON VARIANCE REDUCTION (FEATURE #2)
-# ============================================================
-month = datetime.now().month
-season_factor = 0.85 if month >= 2 else 1.0
-
-df["STD"] = (9 + (df.Tempo / 75) * 4) * season_factor
+min_prob = st.slider("Minimum Probability %", 50, 65, 55)
+min_edge = st.slider("Minimum Edge (pts)", 1.0, 5.0, 2.0)
 
 # ============================================================
-# DIRECTIONAL MODELING (FEATURE #3)
+# RUN MODEL
 # ============================================================
-df["Prob_Over"] = df.apply(
-    lambda r: prob_over(r.Market_Total, r.Projection, r.STD), axis=1
-)
-df["Prob_Under"] = df.apply(
-    lambda r: prob_under(r.Market_Total, r.Projection, r.STD), axis=1
-)
+if home != away:
+    projected_total = round(game_projection(home, away), 2)
+    prob_over = round(over_probability(projected_total, line) * 100, 2)
+    edge = round(projected_total - line, 2)
 
-df["Side"] = np.where(
-    df.Prob_Over > df.Prob_Under, "OVER", "UNDER"
-)
+    decision = "BET" if prob_over >= min_prob and edge >= min_edge else "PASS"
 
-df["Prob"] = df[["Prob_Over","Prob_Under"]].max(axis=1)
-df["Edge"] = (df.Prob - implied_prob(ODDS)) * 100
-df["Kelly_%"] = df.Prob.apply(lambda p: kelly_fraction(p, ODDS) * 100)
-
-# ============================================================
-# CLV CONFIRMATION (FEATURE #4)
-# ============================================================
-now = datetime.now()
-
-for _, r in df.iterrows():
-    line_history.loc[len(line_history)] = [
-        r.Game, r.Market_Total, now
-    ]
-
-line_history.to_csv(LINE_HISTORY_FILE, index=False)
-
-clv = line_history.groupby("Game").Line.diff()
-
-df["CLV_OK"] = df.Game.map(
-    lambda g: clv.loc[clv.index.get_level_values(0) == g].mean()
-)
-
-df = df[
-    ((df.Side == "OVER") & (df.CLV_OK > 0)) |
-    ((df.Side == "UNDER") & (df.CLV_OK < 0))
-]
+    st.subheader("📊 Projection")
+    st.metric("Projected Total", projected_total)
+    st.metric("Market Line", line)
+    st.metric("Edge (pts)", edge)
+    st.metric("Over Probability", f"{prob_over}%")
+    st.metric("Decision", decision)
 
 # ============================================================
-# FILTERS
+# BET TRACKING
 # ============================================================
-min_prob = st.slider("Minimum Probability %", 52, 70, 57)
-min_edge = st.slider("Minimum Edge %", 0, 10, 2)
+st.subheader("🧾 Log Result")
 
-bets = df[
-    (df.Prob * 100 >= min_prob) &
-    (df.Edge >= min_edge)
-]
+result = st.radio("Game Result", ["Pending", "Win", "Loss"], horizontal=True)
 
-# ============================================================
-# DISPLAY BETS
-# ============================================================
-st.subheader("📊 Qualified Bets")
-
-st.dataframe(
-    bets[[
-        "Game","Side","Market_Total","Projection",
-        "Prob","Edge","Kelly_%"
-    ]].assign(Prob=lambda x:(x.Prob*100).round(1)),
-    use_container_width=True
-)
+if st.button("Save Result"):
+    if result == "Win":
+        st.session_state.bet_log.append(1)
+    elif result == "Loss":
+        st.session_state.bet_log.append(-1)
 
 # ============================================================
-# LOG RESULTS
-# ============================================================
-st.subheader("📝 Log Results")
-
-for i, r in bets.iterrows():
-    c1, c2, c3 = st.columns([3,1,1])
-    c1.write(f"{r.Game} — {r.Side}")
-
-    units = round(BANKROLL * r["Kelly_%"] / 100 / 100, 2)
-
-    if c2.button("WIN", key=f"w{i}"):
-        bet_log.loc[len(bet_log)] = [
-            r.Game, r.Side, r.Market_Total,
-            r.Prob, r.Edge, units * 0.91, "W", now
-        ]
-
-    if c3.button("LOSS", key=f"l{i}"):
-        bet_log.loc[len(bet_log)] = [
-            r.Game, r.Side, r.Market_Total,
-            r.Prob, r.Edge, -units, "L", now
-        ]
-
-bet_log.to_csv(BET_LOG_FILE, index=False)
-
-# ============================================================
-# PERFORMANCE SUMMARY
+# ROI SUMMARY
 # ============================================================
 st.subheader("📈 Performance Summary")
 
-total = len(bet_log)
-wins = (bet_log.Result == "W").sum()
-units = bet_log.Units.sum()
+total_bets = len(st.session_state.bet_log)
+wins = st.session_state.bet_log.count(1)
+losses = st.session_state.bet_log.count(-1)
+units = sum(st.session_state.bet_log)
 
-roi = (units / total * 100) if total else 0
-win_pct = (wins / total * 100) if total else 0
+roi = round((units / total_bets) * 100, 2) if total_bets > 0 else 0
+win_pct = round((wins / total_bets) * 100, 2) if total_bets > 0 else 0
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Bets", total)
-c2.metric("Win %", round(win_pct,1))
-c3.metric("Units", round(units,2))
-c4.metric("ROI %", round(roi,2))
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Total Bets", total_bets)
+c2.metric("Wins", wins)
+c3.metric("Losses", losses)
+c4.metric("Units", units)
+c5.metric("ROI %", roi)
+
+# ============================================================
+# FOOTER
+# ============================================================
+st.caption(f"Last Updated: {date.today()} | Data: SportsDataIO")
