@@ -2,9 +2,8 @@ import streamlit as st
 import pandas as pd
 import requests
 import math
-from datetime import date
 
-st.set_page_config(page_title="NCAAB Predictive Model", layout="wide")
+st.set_page_config(page_title="NCAAB Predictive Totals", layout="wide")
 
 # ============================================================
 # CONFIG
@@ -14,27 +13,35 @@ SPORTSDATAIO_KEY = st.secrets["SPORTSDATAIO_API_KEY"]
 ODDS_API_KEY = st.secrets["ODDS_API_KEY"]
 
 SEASON = "2025"
-MIN_EFF = 85
 MIN_POSSESSIONS = 62
+MIN_EFF = 85
 
 CONF_THRESHOLD = 0.60
 EDGE_THRESHOLD = 3.0
 BANKROLL = 100.0
-UNIT_SIZE = 1.0
 
 # ============================================================
-# HELPERS
+# TEAM NAME NORMALIZATION
 # ============================================================
+
+TEAM_ALIASES = {
+    "ole miss": "mississippi",
+    "uconn": "connecticut",
+    "st marys": "saint marys",
+    "unc": "north carolina",
+    "uva": "virginia",
+}
 
 def normalize(name: str) -> str:
-    return (
+    n = (
         name.lower()
-        .replace("state", "st")
-        .replace("saint", "st")
         .replace("&", "and")
         .replace(".", "")
+        .replace("state", "st")
+        .replace("saint", "saint")
         .strip()
     )
+    return TEAM_ALIASES.get(n, n)
 
 # ============================================================
 # LOAD TEAM STATS (SPORTSDATAIO)
@@ -65,9 +72,7 @@ def load_team_stats():
         off_rtg = (t.get("Points", 0) / g) / poss * 100
         def_rtg = (t.get("OpponentPointsPerGame", 0)) / poss * 100
 
-        name = normalize(t["Name"])
-
-        teams[name] = {
+        teams[normalize(t["Name"])] = {
             "poss": poss,
             "off": max(off_rtg, MIN_EFF),
             "def": max(def_rtg, MIN_EFF),
@@ -76,7 +81,7 @@ def load_team_stats():
     return teams
 
 # ============================================================
-# LOAD ODDS (TOTALS)
+# LOAD ODDS (CONSENSUS TOTALS)
 # ============================================================
 
 @st.cache_data(ttl=300)
@@ -108,8 +113,9 @@ def projected_total(home, away, TEAM):
     return round(home_pts + away_pts, 1)
 
 def prob_over(proj, line):
-    # Normal approx with historical NCAAB std dev ≈ 11
-    return round(1 - (0.5 * (1 + math.erf((line - proj) / (11 * math.sqrt(2))))), 3)
+    std = 11  # historical NCAAB total std dev
+    z = (proj - line) / std
+    return round(0.5 * (1 + math.erf(z / math.sqrt(2))), 3)
 
 # ============================================================
 # SESSION STATE
@@ -130,51 +136,57 @@ ODDS = load_odds()
 rows = []
 
 for g in ODDS:
-    home = normalize(g["home_team"])
-    away = normalize(g["away_team"])
+    home = normalize(g.get("home_team", ""))
+    away = normalize(g.get("away_team", ""))
 
     if home not in TEAM or away not in TEAM:
         continue
 
-    for b in g["bookmakers"]:
-        for m in b["markets"]:
-            if m["key"] != "totals":
-                continue
+    # --- consensus market total ---
+    lines = []
+    for b in g.get("bookmakers", []):
+        for m in b.get("markets", []):
+            if m.get("key") == "totals":
+                for o in m.get("outcomes", []):
+                    if o.get("name") == "Over" and isinstance(o.get("point"), (int, float)):
+                        lines.append(o["point"])
 
-            over = next(o for o in m["outcomes"] if o["name"] == "Over")
-            line = over["point"]
+    if not lines:
+        continue
 
-            proj = projected_total(home, away, TEAM)
-            edge = round(proj - line, 2)
-            prob = prob_over(proj, line)
+    market_total = round(sum(lines) / len(lines), 1)
 
-            decision = "BET" if prob >= CONF_THRESHOLD and edge >= EDGE_THRESHOLD else "PASS"
+    proj = projected_total(home, away, TEAM)
+    edge = round(proj - market_total, 2)
+    prob = prob_over(proj, market_total)
 
-            confidence = (
-                "⭐⭐⭐" if prob >= 0.65 else
-                "⭐⭐" if prob >= 0.60 else
-                "⭐"
-            )
+    decision = "BET" if prob >= CONF_THRESHOLD and edge >= EDGE_THRESHOLD else "PASS"
 
-            stake = round((BANKROLL * 0.01) if decision == "BET" else 0, 2)
+    confidence = (
+        "⭐⭐⭐" if prob >= 0.65 else
+        "⭐⭐" if prob >= 0.60 else
+        "⭐"
+    )
 
-            rows.append({
-                "Game": f"{g['away_team']} @ {g['home_team']}",
-                "Market Total": line,
-                "Projected Total": proj,
-                "Edge": edge,
-                "Probability": round(prob * 100, 1),
-                "Confidence": confidence,
-                "Decision": decision,
-                "Stake": stake
-            })
+    stake = round(BANKROLL * 0.01, 2) if decision == "BET" else 0
+
+    rows.append({
+        "Game": f"{g['away_team']} @ {g['home_team']}",
+        "Market Total": market_total,
+        "Projected Total": proj,
+        "Edge": edge,
+        "Probability %": round(prob * 100, 1),
+        "Confidence": confidence,
+        "Decision": decision,
+        "Stake": stake
+    })
 
 # ============================================================
 # DISPLAY
 # ============================================================
 
 if not rows:
-    st.warning("Games detected, but teams could not be matched yet.")
+    st.warning("Games detected, but no valid totals available yet.")
 else:
     df = pd.DataFrame(rows).sort_values("Edge", ascending=False)
     st.dataframe(df, use_container_width=True)
