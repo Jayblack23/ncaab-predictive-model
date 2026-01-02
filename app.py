@@ -26,7 +26,7 @@ for k in ["bet_log", "clv_log"]:
         st.session_state[k] = []
 
 # ============================================================
-# TEAM NAME NORMALIZATION
+# SAFE TEAM NORMALIZATION (FIXED)
 # ============================================================
 def normalize_team(name):
     if not name:
@@ -34,12 +34,11 @@ def normalize_team(name):
     name = name.lower()
     name = re.sub(r"\(.*?\)", "", name)   # remove (FL), (CA)
     name = re.sub(r"[^a-z\s]", "", name)  # remove punctuation
-    name = name.replace("saint", "st")
-    name = name.replace("state", "st")
+    name = re.sub(r"\s+", " ", name)
     return name.strip()
 
 # ============================================================
-# FETCH TEAM METRICS
+# FETCH TEAM METRICS (2025)
 # ============================================================
 @st.cache_data(ttl=86400)
 def fetch_team_metrics():
@@ -63,10 +62,27 @@ def fetch_team_metrics():
             "AdjDE": t.get("DefensiveEfficiency", LEAGUE_AVG_EFF)
         })
 
-    df = pd.DataFrame(rows)
-    return df.set_index("Key")
+    return pd.DataFrame(rows)
 
 teams = fetch_team_metrics()
+
+# ============================================================
+# TEAM LOOKUP WITH FALLBACK MATCHING
+# ============================================================
+def lookup_team(team_name):
+    key = normalize_team(team_name)
+
+    # Exact match
+    exact = teams[teams.Key == key]
+    if not exact.empty:
+        return exact.iloc[0]
+
+    # Fallback: partial match (safe)
+    partial = teams[teams.Key.str.contains(key) | key in teams.Key.values]
+    if not partial.empty:
+        return partial.iloc[0]
+
+    raise ValueError(f"Team not found: {team_name}")
 
 # ============================================================
 # FETCH TODAY'S GAMES
@@ -91,14 +107,8 @@ def expected_points(tempo, off_eff, def_eff):
     return tempo * (off_eff / def_eff)
 
 def project_total(home, away):
-    h = normalize_team(home)
-    a = normalize_team(away)
-
-    if h not in teams.index or a not in teams.index:
-        raise ValueError("Team normalization mismatch")
-
-    A = teams.loc[h]
-    B = teams.loc[a]
+    A = lookup_team(home)
+    B = lookup_team(away)
 
     tempo = (A.Tempo + B.Tempo) / 2
     tempo *= LEAGUE_AVG_TEMPO / tempo
@@ -149,8 +159,8 @@ for g in games:
 
         rows.append({
             "Game": f"{away} @ {home}",
-            "Market": market_total,
-            "Projected": round(proj, 2),
+            "Market Total": market_total,
+            "Projected Total": round(proj, 2),
             "Edge": edge,
             "Prob %": round(prob * 100, 1),
             "Decision": decision
@@ -158,7 +168,7 @@ for g in games:
 
         games_processed += 1
 
-    except:
+    except Exception as e:
         games_skipped += 1
 
 # ============================================================
@@ -167,7 +177,7 @@ for g in games:
 df = pd.DataFrame(rows)
 
 if df.empty:
-    st.warning("Games detected, but name normalization still skipped some teams.")
+    st.error("Games detected but could not be matched. Check team resolution.")
 else:
     st.dataframe(df.sort_values("Edge", ascending=False), use_container_width=True)
 
