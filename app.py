@@ -49,7 +49,10 @@ filtered = [
     r for r in results
     if float(r[3].replace("%","")) >= min_prob and float(r[5].replace("%","")) >= min_edge
 ]
-final_df = pd.DataFrame(
+(final_df = final_df[
+    (final_df["Over %"].str.replace("%","").astype(float) >= min_prob) &
+    (final_df["Edge"].str.replace("%","").astype(float) >= min_edge)
+
     filtered,
     columns=["Game", "Market Total", "Model Total", "Over %", "Fair Odds", "Edge", "Decision"]
 )
