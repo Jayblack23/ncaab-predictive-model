@@ -1,4 +1,4 @@
-# # ============================================================
+# ============================================================
 # IMPORTS
 # ============================================================
 import streamlit as st
@@ -15,22 +15,32 @@ st.set_page_config(page_title="NCAAB Predictive Model", layout="wide")
 if "bet_log" not in st.session_state:
     st.session_state.bet_log = []
 
-if "graded_bets" not in st.session_state:
-    st.session_state.graded_bets = set()
+if "clv_log" not in st.session_state:
+    st.session_state.clv_log = []
+
+if "graded_games" not in st.session_state:
+    st.session_state.graded_games = set()
 
 # ============================================================
-# CONSTANTS
+# CONSTANTS / GUARDRAILS
 # ============================================================
 TOTAL_STD_DEV = 11.5
-REGRESSION_WEIGHT = 0.12
-LEAGUE_AVG_TOTAL = 145
+REGRESSION_WEIGHT = 0.15
 
-# Floors (CRITICAL)
+LEAGUE_AVG_TOTAL = 142
+MIN_FALLBACK_TOTAL = 125
+MAX_FALLBACK_TOTAL = 165
+VALID_TOTAL_RANGE = (120, 170)
+
 MIN_POSSESSIONS = 60
-MIN_EFFICIENCY = 80
+MIN_EFF = 80
+
+HOME_PACE_BONUS = 1.02
+AWAY_PACE_PENALTY = 0.98
+RECENT_WEIGHT = 0.65
 
 # ============================================================
-# LOAD TEAM STATS (CORRECT SCHEMA)
+# LOAD TEAM STATS (SPORTSDATAIO – SAFE SCHEMA)
 # ============================================================
 @st.cache_data(ttl=86400)
 def load_teams():
@@ -76,7 +86,7 @@ def load_games():
 games = load_games()
 
 # ============================================================
-# MODEL CORE (ZERO-SAFE)
+# MODEL CORE
 # ============================================================
 def estimate_possessions(team):
     poss = (
@@ -94,11 +104,7 @@ def team_ratings(team):
     ortg = (team["Points"] / team["Games"]) / poss * 100
     drtg = (team["PointsAllowed"] / team["Games"]) / poss * 100
 
-    # 🔒 FLOORS (THIS FIXES YOUR ERROR)
-    ortg = max(ortg, MIN_EFFICIENCY)
-    drtg = max(drtg, MIN_EFFICIENCY)
-
-    return poss, ortg, drtg
+    return poss, max(ortg, MIN_EFF), max(drtg, MIN_EFF)
 
 def projected_total(home_id, away_id):
     home = TEAM[home_id]
@@ -107,7 +113,11 @@ def projected_total(home_id, away_id):
     h_poss, h_ortg, h_drtg = team_ratings(home)
     a_poss, a_ortg, a_drtg = team_ratings(away)
 
+    # Opponent-adjusted tempo
     possessions = (h_poss + a_poss) / 2
+
+    # Home/Away pace adjustment
+    possessions *= HOME_PACE_BONUS
 
     home_pts = possessions * (h_ortg / a_drtg)
     away_pts = possessions * (a_ortg / h_drtg)
@@ -115,7 +125,8 @@ def projected_total(home_id, away_id):
     return home_pts + away_pts
 
 def fallback_total(proj):
-    return proj * (1 - REGRESSION_WEIGHT) + LEAGUE_AVG_TOTAL * REGRESSION_WEIGHT
+    regressed = proj * (1 - REGRESSION_WEIGHT) + LEAGUE_AVG_TOTAL * REGRESSION_WEIGHT
+    return min(max(regressed, MIN_FALLBACK_TOTAL), MAX_FALLBACK_TOTAL)
 
 def prob_over(proj, line):
     z = (proj - line) / TOTAL_STD_DEV
@@ -124,7 +135,7 @@ def prob_over(proj, line):
 # ============================================================
 # UI CONTROLS
 # ============================================================
-st.title("🏀 College Basketball Predictive Model")
+st.title("🏀 College Basketball Predictive Betting Model")
 
 min_prob = st.slider("Minimum Probability (%)", 50, 65, 55)
 min_edge = st.slider("Minimum Edge (pts)", 1.0, 6.0, 2.0)
@@ -146,7 +157,7 @@ for g in games:
     proj = projected_total(home_id, away_id)
     market = g.get("OverUnder")
 
-    if market not in (None, 0):
+    if market is not None and VALID_TOTAL_RANGE[0] <= market <= VALID_TOTAL_RANGE[1]:
         line = float(market)
         source = "Market"
     else:
@@ -176,4 +187,50 @@ for g in games:
 
 df = pd.DataFrame(rows)
 st.dataframe(df.sort_values("Edge", ascending=False), use_container_width=True)
-st.caption(f"Games displayed: {len(df)}")
+
+# ============================================================
+# ROI + CLV TRACKING
+# ============================================================
+st.subheader("📈 Performance & CLV Tracking")
+
+for i, row in df[df["Decision"] == "BET"].iterrows():
+    game = row["Game"]
+    open_line = row["Line Used"]
+
+    if game in st.session_state.graded_games:
+        continue
+
+    close_line = st.number_input(
+        f"{game} – Closing Line",
+        min_value=120.0,
+        max_value=170.0,
+        step=0.5,
+        key=f"cl_{i}"
+    )
+
+    result = st.selectbox(
+        f"{game} – Result",
+        ["Pending", "Win", "Loss"],
+        key=f"res_{i}"
+    )
+
+    if result in ["Win", "Loss"] and close_line > 0:
+        st.session_state.graded_games.add(game)
+        st.session_state.bet_log.append(1 if result == "Win" else -1)
+        st.session_state.clv_log.append(open_line - close_line)
+
+# ============================================================
+# METRICS
+# ============================================================
+total = len(st.session_state.bet_log)
+wins = st.session_state.bet_log.count(1)
+losses = st.session_state.bet_log.count(-1)
+units = sum(st.session_state.bet_log)
+avg_clv = round(sum(st.session_state.clv_log) / len(st.session_state.clv_log), 2) if st.session_state.clv_log else 0
+
+st.metric("Total Bets", total)
+st.metric("Wins", wins)
+st.metric("Losses", losses)
+st.metric("Units", units)
+st.metric("ROI %", round((units / total) * 100, 2) if total else 0)
+st.metric("Avg CLV (pts)", avg_clv)
