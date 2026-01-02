@@ -42,9 +42,15 @@ for _, row in df.iterrows():
         odds,
         f"{edge}%"
     ])
+min_prob = st.slider("Minimum Over Probability (%)", 50, 70, 58)
+min_edge = st.slider("Minimum Edge (%)", 0, 10, 2)
 
+filtered = [
+    r for r in results
+    if float(r[3].replace("%","")) >= min_prob and float(r[5].replace("%","")) >= min_edge
+]
 final_df = pd.DataFrame(
-    results,
+    filtered,
     columns=["Game", "Market Total", "Model Total", "Over %", "Fair Odds", "Edge"]
 )
 
