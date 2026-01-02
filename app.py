@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import math
+import os
 
 st.set_page_config(page_title="NCAAB Predictive Totals Model", layout="wide")
 
@@ -19,6 +20,8 @@ PACE_SMOOTHING = 0.30
 HOME_BONUS = 1.8
 LEAGUE_AVG_RTG = 100
 
+DATA_FILE = "team_stats.csv"
+
 # ============================================================
 # TEAM NAME NORMALIZATION
 # ============================================================
@@ -33,13 +36,16 @@ ALIASES = {
 }
 
 def normalize(name):
-    return (
+    if not name:
+        return ""
+    name = (
         name.lower()
         .replace("&", "and")
         .replace(".", "")
         .replace("'", "")
         .strip()
     )
+    return ALIASES.get(name, name)
 
 def resolve(name, teams):
     for t in teams:
@@ -48,24 +54,28 @@ def resolve(name, teams):
     return None
 
 # ============================================================
-# LOAD TEAM EFFICIENCY DATA (NO SPORTSDATAIO)
+# LOAD TEAM STATS (LOCAL CSV — SAFE)
 # ============================================================
 
 @st.cache_data(ttl=86400)
 def load_team_stats():
-    # Example public Torvik-style CSV
-    url = "https://raw.githubusercontent.com/roclark/ncaab-data/main/torvik_efficiencies.csv"
-    df = pd.read_csv(url)
+    if not os.path.exists(DATA_FILE):
+        st.error("team_stats.csv not found. Please add it to the project root.")
+        st.stop()
+
+    df = pd.read_csv(DATA_FILE)
+
+    required = {"Team", "Tempo", "AdjOE", "AdjDE"}
+    if not required.issubset(df.columns):
+        st.error("team_stats.csv must contain: Team, Tempo, AdjOE, AdjDE")
+        st.stop()
 
     teams = {}
-
     for _, r in df.iterrows():
-        team = normalize(r["Team"])
-
-        teams[team] = {
-            "poss": r["Tempo"],
-            "off": r["AdjOE"],
-            "def": r["AdjDE"],
+        teams[normalize(r["Team"])] = {
+            "poss": float(r["Tempo"]),
+            "off": float(r["AdjOE"]),
+            "def": float(r["AdjDE"]),
         }
 
     return teams
@@ -93,17 +103,13 @@ def projected_total(home, away, TEAM):
     h = TEAM[home]
     a = TEAM[away]
 
-    # Smoothed possessions
     raw_poss = (h["poss"] + a["poss"]) / 2
     possessions = raw_poss + PACE_SMOOTHING * (MIN_GAME_POSSESSIONS - raw_poss)
 
-    # League-normalized PPP interaction
     home_ppp = (h["off"] / LEAGUE_AVG_RTG) * (LEAGUE_AVG_RTG / a["def"])
     away_ppp = (a["off"] / LEAGUE_AVG_RTG) * (LEAGUE_AVG_RTG / h["def"])
 
     total = possessions * (home_ppp + away_ppp)
-
-    # Home-court scoring premium
     total += HOME_BONUS
 
     return round(total, 1)
@@ -117,7 +123,7 @@ def prob_over(proj, line):
 # UI
 # ============================================================
 
-st.title("🏀 NCAAB Predictive Totals Model (No SportsDataIO)")
+st.title("🏀 NCAAB Predictive Totals Model")
 
 TEAM = load_team_stats()
 ODDS = load_odds()
@@ -168,12 +174,8 @@ for g in ODDS:
         "Decision": decision,
     })
 
-# ============================================================
-# DISPLAY
-# ============================================================
-
 if not rows:
-    st.warning("Games detected, but no valid totals available yet.")
+    st.warning("No valid games found.")
 else:
     df = pd.DataFrame(rows).sort_values("Edge", ascending=False)
     st.dataframe(df, use_container_width=True)
