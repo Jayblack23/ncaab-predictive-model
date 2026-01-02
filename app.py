@@ -9,6 +9,35 @@ if not os.path.exists(BET_FILE):
     pd.DataFrame(columns=["Result"]).to_csv(BET_FILE, index=False)
 bet_history = pd.read_csv(BET_FILE)
 # ---------- Helper functions ----------
+def fetch_ncaab_totals():
+    api_key = st.secrets["ODDS_API_KEY"]
+    url = "https://api.the-odds-api.com/v4/sports/basketball_ncaab/odds"
+
+    params = {
+        "apiKey": api_key,
+        "regions": "us",
+        "markets": "totals",
+        "oddsFormat": "american"
+    }
+
+    response = requests.get(url, params=params)
+    data = response.json()
+
+    games = []
+
+    for game in data:
+        try:
+            totals = game["bookmakers"][0]["markets"][0]["outcomes"]
+            total = totals[0]["point"]
+
+            games.append({
+                "Game": f"{game['away_team']} vs {game['home_team']}",
+                "Line": total
+            })
+        except:
+            continue
+
+    return pd.DataFrame(games)
 def normal_cdf(x):
     return (1.0 + erf(x / sqrt(2.0))) / 2.0
 
