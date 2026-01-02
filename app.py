@@ -1,4 +1,4 @@
-# ============================================================
+# # ============================================================
 # IMPORTS
 # ============================================================
 import streamlit as st
@@ -25,8 +25,12 @@ TOTAL_STD_DEV = 11.5
 REGRESSION_WEIGHT = 0.12
 LEAGUE_AVG_TOTAL = 145
 
+# Floors (CRITICAL)
+MIN_POSSESSIONS = 60
+MIN_EFFICIENCY = 80
+
 # ============================================================
-# LOAD TEAM STATS (SPORTSDATAIO – CORRECT SCHEMA)
+# LOAD TEAM STATS (CORRECT SCHEMA)
 # ============================================================
 @st.cache_data(ttl=86400)
 def load_teams():
@@ -44,14 +48,8 @@ def load_teams():
             "TeamID": t["TeamID"],
             "Name": t["Name"],
             "Games": games,
-
-            # Season totals
             "Points": t.get("Points", 0),
-
-            # NCAAB uses OpponentPointsPerGame
             "PointsAllowed": t.get("OpponentPointsPerGame", 0) * games,
-
-            # Possession components
             "FGA": t.get("FieldGoalsAttempted", 0),
             "FTA": t.get("FreeThrowsAttempted", 0),
             "ORB": t.get("OffensiveRebounds", 0),
@@ -78,7 +76,7 @@ def load_games():
 games = load_games()
 
 # ============================================================
-# MODEL CORE (DERIVED POSSESSIONS)
+# MODEL CORE (ZERO-SAFE)
 # ============================================================
 def estimate_possessions(team):
     poss = (
@@ -88,13 +86,17 @@ def estimate_possessions(team):
         + 0.44 * team["FTA"]
     ) / team["Games"]
 
-    return max(poss, 60)
+    return max(poss, MIN_POSSESSIONS)
 
 def team_ratings(team):
     poss = estimate_possessions(team)
 
     ortg = (team["Points"] / team["Games"]) / poss * 100
     drtg = (team["PointsAllowed"] / team["Games"]) / poss * 100
+
+    # 🔒 FLOORS (THIS FIXES YOUR ERROR)
+    ortg = max(ortg, MIN_EFFICIENCY)
+    drtg = max(drtg, MIN_EFFICIENCY)
 
     return poss, ortg, drtg
 
@@ -122,36 +124,10 @@ def prob_over(proj, line):
 # ============================================================
 # UI CONTROLS
 # ============================================================
-st.title("🏀 College Basketball Predictive Betting Model")
+st.title("🏀 College Basketball Predictive Model")
 
 min_prob = st.slider("Minimum Probability (%)", 50, 65, 55)
 min_edge = st.slider("Minimum Edge (pts)", 1.0, 6.0, 2.0)
-
-# ============================================================
-# MANUAL MATCHUP TOOL
-# ============================================================
-st.subheader("🧪 Manual Matchup Projection")
-
-team_ids = list(TEAM_NAME.keys())
-c1, c2, c3 = st.columns(3)
-
-with c1:
-    away_id = st.selectbox("Away Team", team_ids, format_func=lambda x: TEAM_NAME[x])
-with c2:
-    home_id = st.selectbox("Home Team", team_ids, format_func=lambda x: TEAM_NAME[x])
-with c3:
-    manual_total = st.number_input("Market Total (optional)", 0.0, 200.0, 0.0)
-
-if st.button("Project Matchup"):
-    proj = projected_total(home_id, away_id)
-    line = manual_total if manual_total > 0 else fallback_total(proj)
-    edge = proj - line
-    prob = prob_over(proj, line)
-
-    st.metric("Projected Total", round(proj, 2))
-    st.metric("Comparison Line", round(line, 2))
-    st.metric("Edge", round(edge, 2))
-    st.metric("Over Probability %", round(prob * 100, 1))
 
 # ============================================================
 # TODAY'S SLATE
@@ -201,37 +177,3 @@ for g in games:
 df = pd.DataFrame(rows)
 st.dataframe(df.sort_values("Edge", ascending=False), use_container_width=True)
 st.caption(f"Games displayed: {len(df)}")
-
-# ============================================================
-# ROI TRACKING (SAFE – NO DUPLICATION)
-# ============================================================
-st.subheader("📈 Performance Summary")
-
-for i, row in df[df["Decision"] == "BET"].iterrows():
-    bet_id = row["Game"]
-    if bet_id in st.session_state.graded_bets:
-        continue
-
-    result = st.selectbox(
-        f"{bet_id}",
-        ["Pending", "Win", "Loss"],
-        key=f"grade_{i}"
-    )
-
-    if result == "Win":
-        st.session_state.bet_log.append(1)
-        st.session_state.graded_bets.add(bet_id)
-    elif result == "Loss":
-        st.session_state.bet_log.append(-1)
-        st.session_state.graded_bets.add(bet_id)
-
-total = len(st.session_state.bet_log)
-wins = st.session_state.bet_log.count(1)
-losses = st.session_state.bet_log.count(-1)
-units = sum(st.session_state.bet_log)
-
-st.metric("Total Bets", total)
-st.metric("Wins", wins)
-st.metric("Losses", losses)
-st.metric("Units", units)
-st.metric("ROI %", round((units / total) * 100, 2) if total else 0)
