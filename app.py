@@ -16,7 +16,7 @@ if "bankroll" not in st.session_state:
     st.session_state.bankroll = 100.0
 
 if "bet_log" not in st.session_state:
-    st.session_state.bet_log = []  # +1 win, -1 loss (units)
+    st.session_state.bet_log = []
 
 # ============================================================
 # CONSTANTS
@@ -35,7 +35,7 @@ KELLY_FRACTION = 0.5
 MAX_STAKE_PCT = 5.0
 
 # ============================================================
-# LOAD TEAM STATS (SPORTSDATAIO — FIXED SCHEMA)
+# LOAD TEAM STATS (SAFE)
 # ============================================================
 @st.cache_data(ttl=86400)
 def load_team_stats():
@@ -47,8 +47,12 @@ def load_team_stats():
     names = {}
 
     for t in r.json():
-        g = t.get("Games", 0)
-        if g == 0:
+        g = t.get("Games")
+        pts = t.get("Points")
+        opp_ppg = t.get("OpponentPointsPerGame")
+
+        # Skip teams with incomplete data
+        if not g or not pts or not opp_ppg:
             continue
 
         fga = t.get("FieldGoalsAttempted", 0)
@@ -56,13 +60,11 @@ def load_team_stats():
         orb = t.get("OffensiveRebounds", 0)
         tov = t.get("Turnovers", 0)
 
-        # Possessions per game
         poss = (fga - orb + tov + 0.44 * fta) / g
         poss = max(poss, MIN_POSSESSIONS)
 
-        # Ratings (CORRECT FIELDS)
-        off_rtg = (t["Points"] / g) / poss * 100
-        def_rtg = (t["OpponentPointsPerGame"]) / poss * 100
+        off_rtg = (pts / g) / poss * 100
+        def_rtg = opp_ppg / poss * 100
 
         teams[t["TeamID"]] = {
             "poss": poss,
@@ -108,18 +110,19 @@ odds_raw = load_odds()
 
 ODDS = {}
 for g in odds_raw:
-    home = g["home_team"].lower()
-    away = g["away_team"].lower()
+    home = g.get("home_team", "").lower()
+    away = g.get("away_team", "").lower()
+
     for b in g.get("bookmakers", []):
         for m in b.get("markets", []):
-            if m["key"] == "totals":
-                total = m["outcomes"][0].get("point")
-                if total:
-                    ODDS[(away, home)] = float(total)
-                    break
+            if m.get("key") == "totals":
+                for o in m.get("outcomes", []):
+                    if "point" in o:
+                        ODDS[(away, home)] = float(o["point"])
+                        break
 
 # ============================================================
-# MODEL FUNCTIONS (CORRECT PPP MATH)
+# MODEL FUNCTIONS
 # ============================================================
 def projected_total(home_id, away_id):
     h = TEAM[home_id]
@@ -141,7 +144,7 @@ def kelly(prob):
     return min(max(raw * 100, 0), MAX_STAKE_PCT)
 
 # ============================================================
-# UI CONTROLS
+# UI
 # ============================================================
 st.title("🏀 College Basketball Totals Betting Model")
 
@@ -158,7 +161,9 @@ min_edge = st.slider("Minimum Edge (pts)", 1.0, 6.0, 2.0)
 rows = []
 
 for g in games:
-    h, a = g.get("HomeTeamID"), g.get("AwayTeamID")
+    h = g.get("HomeTeamID")
+    a = g.get("AwayTeamID")
+
     if h not in TEAM or a not in TEAM:
         continue
 
@@ -184,14 +189,9 @@ for g in games:
         prob = p_under
         edge = line - proj
 
-    decision = (
-        "BET"
-        if prob >= AUTO_BET_PROB and edge >= AUTO_BET_EDGE
-        else "PASS"
-    )
+    decision = "BET" if (prob >= AUTO_BET_PROB and edge >= AUTO_BET_EDGE) else "PASS"
 
     stars = "⭐⭐⭐" if prob >= 0.62 else "⭐⭐" if prob >= 0.58 else "⭐"
-
     stake_pct = kelly(prob)
     stake_amt = round(st.session_state.bankroll * stake_pct / 100, 2)
 
@@ -212,7 +212,7 @@ df = pd.DataFrame(rows).sort_values("Edge", ascending=False)
 st.dataframe(df, use_container_width=True)
 
 # ============================================================
-# ROI TRACKING
+# ROI SUMMARY
 # ============================================================
 st.subheader("📈 Performance Summary")
 
