@@ -1,202 +1,230 @@
-# =========================
-# IMPORTS (TOP OF FILE)
-# =========================
+# ============================================================
+# IMPORTS
+# ============================================================
 import streamlit as st
 import pandas as pd
 import requests
 import os
 from math import erf, sqrt
+from datetime import datetime
 
-# =========================
+# ============================================================
 # CONFIG
-# =========================
-st.set_page_config(page_title="NCAAB Predictive Totals Model", layout="wide")
+# ============================================================
+st.set_page_config(
+    page_title="Elite NCAAB Totals Model",
+    layout="wide"
+)
 
-BET_FILE = "bets.csv"
+BANKROLL = 1000
+ODDS = -110
 
-# =========================
-# INITIALIZE BET STORAGE
-# =========================
-if not os.path.exists(BET_FILE):
-    pd.DataFrame(columns=["Result"]).to_csv(BET_FILE, index=False)
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
 
-bet_history = pd.read_csv(BET_FILE)
+BET_LOG_FILE = f"{DATA_DIR}/bet_log.csv"
+LINE_HISTORY_FILE = f"{DATA_DIR}/line_history.csv"
+MODEL_WEIGHTS_FILE = f"{DATA_DIR}/model_weights.csv"
 
-# =========================
-# HELPER FUNCTIONS
-# =========================
+# ============================================================
+# INITIALIZE FILES
+# ============================================================
+if not os.path.exists(BET_LOG_FILE):
+    pd.DataFrame(columns=[
+        "Game","Bet_Line","Close_Line",
+        "Prob","Edge","Units","Result","Date"
+    ]).to_csv(BET_LOG_FILE, index=False)
+
+if not os.path.exists(LINE_HISTORY_FILE):
+    pd.DataFrame(columns=["Game","Line","Time"]).to_csv(
+        LINE_HISTORY_FILE, index=False
+    )
+
+if not os.path.exists(MODEL_WEIGHTS_FILE):
+    pd.DataFrame({
+        "signal": ["model", "market"],
+        "weight": [0.65, 0.35]
+    }).to_csv(MODEL_WEIGHTS_FILE, index=False)
+
+bet_log = pd.read_csv(BET_LOG_FILE)
+line_history = pd.read_csv(LINE_HISTORY_FILE)
+weights = pd.read_csv(MODEL_WEIGHTS_FILE)
+
+# ============================================================
+# MATH
+# ============================================================
 def normal_cdf(x):
-    return (1.0 + erf(x / sqrt(2.0))) / 2.0
-
-def over_probability(line, projection, std=11):
-    z = (line - projection) / std
-    return 1 - normal_cdf(z)
-
-def fair_odds(prob):
-    if prob >= 0.5:
-        return round(-(prob / (1 - prob)) * 100)
-    else:
-        return round((1 - prob) / prob * 100)
+    return (1 + erf(x / sqrt(2))) / 2
 
 def implied_prob(odds):
     return abs(odds) / (abs(odds) + 100)
 
-# =========================
-# FETCH LIVE TOTALS
-# =========================
-def fetch_ncaab_totals():
-    api_key = st.secrets["ODDS_API_KEY"]
+def fair_odds(p):
+    return round(-(p / (1 - p)) * 100) if p > 0.5 else round((1 - p) / p * 100)
 
-    url = "https://api.the-odds-api.com/v4/sports/basketball_ncaab/odds"
-    params = {
-        "apiKey": api_key,
-        "regions": "us",
-        "markets": "totals",
-        "oddsFormat": "american"
-    }
+def over_prob(line, proj, std):
+    z = (line - proj) / std
+    return 1 - normal_cdf(z)
 
-    response = requests.get(url, params=params)
+def kelly_fraction(p, odds):
+    b = 100 / abs(odds)
+    return max((p * b - (1 - p)) / b, 0)
 
-    st.subheader("🔍 Odds API Status")
-    st.write("Status Code:", response.status_code)
-
-    try:
-        data = response.json()
-    except:
-        st.error("API response could not be parsed")
-        return pd.DataFrame()
+# ============================================================
+# ODDS API
+# ============================================================
+@st.cache_data(ttl=300)
+def fetch_odds():
+    r = requests.get(
+        "https://api.the-odds-api.com/v4/sports/basketball_ncaab/odds",
+        params={
+            "apiKey": st.secrets["ODDS_API_KEY"],
+            "regions": "us",
+            "markets": "totals",
+            "oddsFormat": "american"
+        }
+    )
+    data = r.json()
+    rows = []
 
     if not isinstance(data, list):
-        st.error("API did not return game list")
-        st.write(data)
         return pd.DataFrame()
 
-    games = []
-
-    for game in data:
+    for g in data:
         try:
-            bookmakers = game.get("bookmakers", [])
-            if not bookmakers:
-                continue
-
-            markets = bookmakers[0].get("markets", [])
-            if not markets:
-                continue
-
-            outcomes = markets[0].get("outcomes", [])
-            if not outcomes:
-                continue
-
-            total = outcomes[0]["point"]
-
-            games.append({
-                "Game": f"{game['away_team']} vs {game['home_team']}",
-                "Line": total
+            total = g["bookmakers"][0]["markets"][0]["outcomes"][0]["point"]
+            rows.append({
+                "Game": f"{g['away_team']} vs {g['home_team']}",
+                "Market_Total": total
             })
         except:
             continue
 
-    return pd.DataFrame(games)
+    return pd.DataFrame(rows)
 
-# =========================
-# UI HEADER
-# =========================
-st.title("🏀 NCAAB Predictive Totals Model")
-st.caption("Live odds • Probability model • ROI tracking")
+# ============================================================
+# UI
+# ============================================================
+st.title("🏀 Elite NCAAB Totals Engine")
+st.caption("Probability • CLV • Kelly • Self-Learning")
 
-# =========================
-# LOAD DATA
-# =========================
-st.subheader("🔄 Live Market Totals")
+if st.button("🔄 Refresh Odds"):
+    st.experimental_rerun()
 
-df = fetch_ncaab_totals()
+df = fetch_odds()
 
 if df.empty:
-    st.warning("No live totals available — using manual fallback")
+    st.warning("Using fallback data.csv")
     df = pd.read_csv("data.csv")
 
-# TEMP projection logic (replace later with true model)
-df["Projection"] = df["Line"] + 2.5
+# ============================================================
+# MODEL INPUTS (SAFE PLACEHOLDERS)
+# Replace later with real KenPom CSV/API
+# ============================================================
+df["Tempo"] = 68 + (df.index % 6) * 2
+df["AdjOE_H"] = 108 + (df.index % 4) * 1.5
+df["AdjOE_A"] = 106 + (df.index % 4) * 1.5
 
-# =========================
-# FILTER CONTROLS
-# =========================
-min_prob = st.slider("Minimum Over Probability (%)", 50, 70, 58)
-min_edge = st.slider("Minimum Edge (%)", 0, 10, 2)
+# ============================================================
+# PROJECTION ENGINE
+# ============================================================
+df["Model_Total"] = (
+    df["Tempo"] * (df["AdjOE_H"] + df["AdjOE_A"]) / 100
+)
 
-# =========================
-# MODEL CALCULATIONS
-# =========================
-results = []
+w_model = weights.loc[weights.signal=="model","weight"].values[0]
+w_market = weights.loc[weights.signal=="market","weight"].values[0]
 
-for _, row in df.iterrows():
-    prob = over_probability(row["Line"], row["Projection"])
-    odds = fair_odds(prob)
-    edge = round((prob - implied_prob(-110)) * 100, 2)
+df["Projection"] = (
+    w_model * df["Model_Total"] +
+    w_market * df["Market_Total"]
+)
 
-    decision = "BET" if prob >= min_prob / 100 and edge >= min_edge else "PASS"
+df["STD"] = 9 + (df["Tempo"] / 75) * 4
 
-    results.append({
-        "Game": row["Game"],
-        "Market Total": row["Line"],
-        "Model Total": row["Projection"],
-        "Over %": round(prob * 100, 1),
-        "Fair Odds": odds,
-        "Edge %": edge,
-        "Decision": decision
-    })
+df["Prob"] = df.apply(
+    lambda r: over_prob(r["Market_Total"], r["Projection"], r["STD"]),
+    axis=1
+)
 
-final_df = pd.DataFrame(results)
+df["Edge"] = (df["Prob"] - implied_prob(ODDS)) * 100
+df["Fair_Odds"] = df["Prob"].apply(fair_odds)
+df["Kelly_%"] = df["Prob"].apply(lambda p: kelly_fraction(p, ODDS) * 100)
 
-final_df = final_df[
-    (final_df["Over %"] >= min_prob) &
-    (final_df["Edge %"] >= min_edge)
-]
+# ============================================================
+# FILTERS
+# ============================================================
+min_prob = st.slider("Min Probability %", 52, 70, 57)
+min_edge = st.slider("Min Edge %", 0, 10, 2)
 
-# =========================
-# DISPLAY TABLE
-# =========================
-st.subheader("📊 Model Results")
-st.dataframe(final_df, use_container_width=True)
+df["Decision"] = df.apply(
+    lambda r: "BET"
+    if r["Prob"]*100 >= min_prob and r["Edge"] >= min_edge
+    else "PASS",
+    axis=1
+)
 
-# =========================
-# LOG BET RESULTS
-# =========================
-st.subheader("📝 Log Bet Results")
+bets = df[df.Decision=="BET"].copy()
 
-for i, row in final_df.iterrows():
-    if row["Decision"] == "BET":
-        col1, col2, col3 = st.columns([3, 1, 1])
-        col1.write(row["Game"])
+# ============================================================
+# DISPLAY
+# ============================================================
+st.subheader("📊 Qualified Bets")
+st.dataframe(
+    bets[[
+        "Game","Market_Total","Projection",
+        "Prob","Edge","Fair_Odds","Kelly_%"
+    ]].assign(Prob=lambda x:(x.Prob*100).round(1)),
+    use_container_width=True
+)
 
-        if col2.button("WIN", key=f"win_{i}"):
-            bet_history.loc[len(bet_history)] = [1]
-            bet_history.to_csv(BET_FILE, index=False)
+# ============================================================
+# LINE HISTORY (STEAM / CLV)
+# ============================================================
+now = datetime.now()
+for _, r in df.iterrows():
+    line_history.loc[len(line_history)] = [r.Game, r.Market_Total, now]
+line_history.to_csv(LINE_HISTORY_FILE, index=False)
 
-        if col3.button("LOSS", key=f"loss_{i}"):
-            bet_history.loc[len(bet_history)] = [-1]
-            bet_history.to_csv(BET_FILE, index=False)
+# ============================================================
+# LOG RESULTS
+# ============================================================
+st.subheader("📝 Log Results")
 
-# =========================
-# PERFORMANCE SUMMARY
-# =========================
-st.subheader("📈 Performance Summary")
+for i, r in bets.iterrows():
+    c1,c2,c3 = st.columns([3,1,1])
+    c1.write(r.Game)
 
-total_bets = len(bet_history)
-wins = (bet_history["Result"] == 1).sum()
-losses = (bet_history["Result"] == -1).sum()
-units = bet_history["Result"].sum()
+    units = round(BANKROLL * r["Kelly_%"] / 100 / 100, 2)
 
-if total_bets > 0:
-    roi = round((units / total_bets) * 100, 2)
-    win_pct = round((wins / total_bets) * 100, 2)
-else:
-    roi = 0
-    win_pct = 0
+    if c2.button("WIN", key=f"w{i}"):
+        bet_log.loc[len(bet_log)] = [
+            r.Game, r.Market_Total, None,
+            r.Prob, r.Edge, units*0.91, "W", now
+        ]
 
-st.metric("Total Bets", total_bets)
-st.metric("Wins", wins)
-st.metric("Losses", losses)
-st.metric("Units", units)
-st.metric("ROI %", roi)
-st.metric("Win %", win_pct)
+    if c3.button("LOSS", key=f"l{i}"):
+        bet_log.loc[len(bet_log)] = [
+            r.Game, r.Market_Total, None,
+            r.Prob, r.Edge, -units, "L", now
+        ]
+
+bet_log.to_csv(BET_LOG_FILE, index=False)
+
+# ============================================================
+# PERFORMANCE
+# ============================================================
+st.subheader("📈 Performance")
+
+total = len(bet_log)
+wins = (bet_log.Result=="W").sum()
+units = bet_log.Units.sum()
+
+roi = (units / total * 100) if total else 0
+win_pct = (wins / total * 100) if total else 0
+
+c1,c2,c3,c4 = st.columns(4)
+c1.metric("Bets", total)
+c2.metric("Win %", round(win_pct,1))
+c3.metric("Units", round(units,2))
+c4.metric("ROI %", round(roi,2))
