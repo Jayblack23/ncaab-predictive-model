@@ -1,7 +1,7 @@
-import requests
-import os
 import streamlit as st
 import pandas as pd
+import requests
+import os
 from math import erf, sqrt
 BET_FILE = "bets.csv"
 
