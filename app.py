@@ -7,16 +7,19 @@ import requests
 import math
 from datetime import date
 
-st.set_page_config(page_title="NCAAB Predictive Model", layout="wide")
+st.set_page_config(page_title="NCAAB Totals Model", layout="wide")
 
 # ============================================================
 # SESSION STATE
 # ============================================================
 if "bet_log" not in st.session_state:
-    st.session_state.bet_log = []
+    st.session_state.bet_log = []  # +1 / -1
+
+if "bankroll" not in st.session_state:
+    st.session_state.bankroll = 100.0
 
 # ============================================================
-# CONSTANTS / GUARDRAILS
+# CONSTANTS
 # ============================================================
 TOTAL_STD_DEV = 11.5
 REGRESSION_WEIGHT = 0.15
@@ -28,15 +31,16 @@ VALID_TOTAL_RANGE = (120, 170)
 
 MIN_POSSESSIONS = 60
 MIN_EFF = 80
-
 HOME_PACE_BONUS = 1.02
 
-# Kelly safety
 KELLY_FRACTION = 0.5
 MAX_STAKE_PCT = 5.0
 
+AUTO_BET_PROB = 0.60
+AUTO_BET_EDGE = 3.0
+
 # ============================================================
-# LOAD TEAM STATS
+# DATA LOADERS
 # ============================================================
 @st.cache_data(ttl=86400)
 def load_teams():
@@ -44,13 +48,12 @@ def load_teams():
     url = "https://api.sportsdata.io/v3/cbb/stats/json/TeamSeasonStats/2025"
     r = requests.get(url, headers=headers)
 
-    teams = []
+    rows = []
     for t in r.json():
         g = t.get("Games", 0)
         if g == 0:
             continue
-
-        teams.append({
+        rows.append({
             "TeamID": t["TeamID"],
             "Name": t["Name"],
             "Games": g,
@@ -61,16 +64,12 @@ def load_teams():
             "ORB": t.get("OffensiveRebounds", 0),
             "TOV": t.get("Turnovers", 0),
         })
-
-    return pd.DataFrame(teams)
+    return pd.DataFrame(rows)
 
 teams_df = load_teams()
 TEAM = teams_df.set_index("TeamID").to_dict("index")
 NAME = teams_df.set_index("TeamID")["Name"].to_dict()
 
-# ============================================================
-# LOAD TODAY'S GAMES
-# ============================================================
 @st.cache_data(ttl=600)
 def load_games():
     headers = {"Ocp-Apim-Subscription-Key": st.secrets["SPORTSDATAIO_API_KEY"]}
@@ -82,7 +81,7 @@ def load_games():
 games = load_games()
 
 # ============================================================
-# MODEL CORE
+# MODEL
 # ============================================================
 def possessions(t):
     p = (t["FGA"] - t["ORB"] + t["TOV"] + 0.44 * t["FTA"]) / t["Games"]
@@ -97,11 +96,8 @@ def ratings(t):
 def projected_total(h, a):
     hp, ho, hd = ratings(TEAM[h])
     ap, ao, ad = ratings(TEAM[a])
-
     poss = (hp + ap) / 2 * HOME_PACE_BONUS
-    home_pts = poss * (ho / ad)
-    away_pts = poss * (ao / hd)
-    return home_pts + away_pts
+    return poss * (ho / ad + ao / hd)
 
 def fallback_total(p):
     reg = p * (1 - REGRESSION_WEIGHT) + LEAGUE_AVG_TOTAL * REGRESSION_WEIGHT
@@ -111,14 +107,21 @@ def prob_over(p, l):
     z = (p - l) / TOTAL_STD_DEV
     return 0.5 * (1 + math.erf(z / math.sqrt(2)))
 
-def kelly(prob, edge):
-    raw = ((prob * (edge / TOTAL_STD_DEV)) - (1 - prob)) * KELLY_FRACTION
+def kelly(prob):
+    raw = (prob - (1 - prob)) * KELLY_FRACTION
     return min(max(raw * 100, 0), MAX_STAKE_PCT)
 
 # ============================================================
 # UI
 # ============================================================
 st.title("🏀 College Basketball Totals Model")
+
+st.session_state.bankroll = st.number_input(
+    "Starting / Current Bankroll ($)",
+    min_value=10.0,
+    value=st.session_state.bankroll,
+    step=10.0
+)
 
 min_prob = st.slider("Min Probability (%)", 50, 65, 55)
 min_edge = st.slider("Min Edge (pts)", 1.0, 6.0, 2.0)
@@ -129,8 +132,7 @@ min_edge = st.slider("Min Edge (pts)", 1.0, 6.0, 2.0)
 rows = []
 
 for g in games:
-    h = g.get("HomeTeamID")
-    a = g.get("AwayTeamID")
+    h, a = g.get("HomeTeamID"), g.get("AwayTeamID")
     if h not in TEAM or a not in TEAM:
         continue
 
@@ -140,46 +142,62 @@ for g in games:
     if market and VALID_TOTAL_RANGE[0] <= market <= VALID_TOTAL_RANGE[1]:
         line = float(market)
         source = "Market"
-        adj_prob = min_prob
-        adj_edge = min_edge
+        adj_prob, adj_edge = min_prob, min_edge
     else:
         line = fallback_total(proj)
         source = "Fallback"
-        adj_prob = min_prob + 3
-        adj_edge = min_edge + 1
+        adj_prob, adj_edge = min_prob + 3, min_edge + 1
 
     p_over = prob_over(proj, line)
     p_under = 1 - p_over
 
-    edge_over = proj - line
-    edge_under = -edge_over
-
     if p_over >= p_under:
-        side = "OVER"
-        prob = p_over
-        edge = edge_over
+        side, prob, edge = "OVER", p_over, proj - line
     else:
-        side = "UNDER"
-        prob = p_under
-        edge = edge_under
+        side, prob, edge = "UNDER", p_under, line - proj
 
-    decision = "BET" if prob * 100 >= adj_prob and abs(edge) >= adj_edge else "PASS"
+    auto_bet = prob >= AUTO_BET_PROB and abs(edge) >= AUTO_BET_EDGE
 
-    stars = "⭐⭐⭐" if prob >= 0.6 else "⭐⭐" if prob >= 0.57 else "⭐"
-    stake = kelly(prob, abs(edge))
+    decision = (
+        "BET"
+        if auto_bet or (prob * 100 >= adj_prob and abs(edge) >= adj_edge)
+        else "PASS"
+    )
+
+    stake_pct = kelly(prob)
+    stake_amt = round(st.session_state.bankroll * stake_pct / 100, 2)
 
     rows.append({
         "Game": f"{NAME[a]} @ {NAME[h]}",
         "Side": side,
         "Line": round(line, 1),
-        "Source": source,
-        "Proj Total": round(proj, 1),
+        "Proj": round(proj, 1),
         "Edge": round(edge, 1),
         "Prob %": round(prob * 100, 1),
-        "Confidence": stars,
-        "Stake %": round(stake, 2),
+        "Stake %": round(stake_pct, 2),
+        "Stake $": stake_amt,
         "Decision": decision
     })
 
 df = pd.DataFrame(rows).sort_values("Edge", ascending=False)
 st.dataframe(df, use_container_width=True)
+
+# ============================================================
+# ROI / PERFORMANCE
+# ============================================================
+st.subheader("📈 Performance Summary")
+
+total = len(st.session_state.bet_log)
+wins = st.session_state.bet_log.count(1)
+losses = st.session_state.bet_log.count(-1)
+units = sum(st.session_state.bet_log)
+
+roi = round((units / total) * 100, 2) if total else 0
+win_pct = round((wins / total) * 100, 2) if total else 0
+
+st.metric("Total Bets", total)
+st.metric("Wins", wins)
+st.metric("Losses", losses)
+st.metric("Units", units)
+st.metric("ROI %", roi)
+st.metric("Win %", win_pct)
