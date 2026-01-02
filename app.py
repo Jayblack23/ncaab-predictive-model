@@ -41,7 +41,7 @@ for _, row in df.iterrows():
         f"{prob*100:.1f}%",
         odds,
         f"{edge}%"
-    ])
+    ])decision = "BET" if prob >= min_prob/100 and edge >= min_edge else "PASS"
 min_prob = st.slider("Minimum Over Probability (%)", 50, 70, 58)
 min_edge = st.slider("Minimum Edge (%)", 0, 10, 2)
 
@@ -51,7 +51,8 @@ filtered = [
 ]
 final_df = pd.DataFrame(
     filtered,
-    columns=["Game", "Market Total", "Model Total", "Over %", "Fair Odds", "Edge"]
+    columns=["Game", "Market Total", "Model Total", "Over %", "Fair Odds", "Edge", "Decision"]
+)
 )
 
 st.dataframe(final_df, use_container_width=True)
