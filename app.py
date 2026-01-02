@@ -10,7 +10,7 @@ from datetime import date
 st.set_page_config(page_title="NCAAB Predictive Model", layout="wide")
 
 # ============================================================
-# SESSION STATE (ROI PERSISTENCE)
+# SESSION STATE
 # ============================================================
 if "bet_log" not in st.session_state:
     st.session_state.bet_log = []
@@ -24,10 +24,10 @@ if "bets" not in st.session_state:
 LEAGUE_AVG_TEMPO = 68
 LEAGUE_AVG_EFF = 102
 TOTAL_STD_DEV = 11.5
-REGRESSION_WEIGHT = 0.15  # KenPom-style regression
+REGRESSION_WEIGHT = 0.12  # light KenPom-style regression
 
 # ============================================================
-# LOAD TEAM METRICS (TEAMID-BASED — CRITICAL FIX)
+# LOAD TEAM METRICS (TeamID-based)
 # ============================================================
 @st.cache_data(ttl=86400)
 def load_teams():
@@ -48,8 +48,8 @@ def load_teams():
     return pd.DataFrame(rows)
 
 teams_df = load_teams()
-TEAM_LOOKUP = teams_df.set_index("TeamID").to_dict("index")
-TEAM_NAME_MAP = teams_df.set_index("TeamID")["Name"].to_dict()
+TEAM = teams_df.set_index("TeamID").to_dict("index")
+TEAM_NAME = teams_df.set_index("TeamID")["Name"].to_dict()
 
 # ============================================================
 # LOAD TODAY'S GAMES
@@ -65,25 +65,26 @@ def load_games():
 games = load_games()
 
 # ============================================================
-# MODEL CORE
+# MODEL CORE (FIXED)
 # ============================================================
-def expected_points(tempo, oe, de):
-    return tempo * (oe / de)
+def expected_points(possessions, off_eff, def_eff):
+    return possessions * (off_eff / def_eff)
 
-def raw_projected_total(home_id, away_id):
-    A = TEAM_LOOKUP[home_id]
-    B = TEAM_LOOKUP[away_id]
+def projected_total(home_id, away_id):
+    A = TEAM[home_id]
+    B = TEAM[away_id]
 
-    tempo = (A["Tempo"] + B["Tempo"]) / 2
-    tempo *= LEAGUE_AVG_TEMPO / tempo
+    # TRUE blended tempo (NO forced normalization)
+    possessions = (A["Tempo"] + B["Tempo"]) / 2
 
-    return (
-        expected_points(tempo, A["OE"], B["DE"]) +
-        expected_points(tempo, B["OE"], A["DE"])
-    )
+    home_pts = expected_points(possessions, A["OE"], B["DE"])
+    away_pts = expected_points(possessions, B["OE"], A["DE"])
+
+    return home_pts + away_pts
 
 def kenpom_fallback(proj):
-    league_mean_total = LEAGUE_AVG_TEMPO * 2
+    # Regress slightly toward league mean TOTAL (~145)
+    league_mean_total = LEAGUE_AVG_TEMPO * (LEAGUE_AVG_EFF / LEAGUE_AVG_EFF) * 2
     return proj * (1 - REGRESSION_WEIGHT) + league_mean_total * REGRESSION_WEIGHT
 
 def prob_over(proj, line):
@@ -99,22 +100,22 @@ min_prob = st.slider("Min Probability (%)", 50, 65, 55)
 min_edge = st.slider("Min Edge (pts)", 1.0, 6.0, 2.0)
 
 # ============================================================
-# MANUAL MATCHUP TOOL (WORKING DROPDOWNS)
+# MANUAL MATCHUP TOOL
 # ============================================================
 st.subheader("🧪 Manual Matchup Projection")
 
-team_ids = list(TEAM_NAME_MAP.keys())
-
+team_ids = list(TEAM_NAME.keys())
 c1, c2, c3 = st.columns(3)
+
 with c1:
-    away_id = st.selectbox("Away Team", team_ids, format_func=lambda x: TEAM_NAME_MAP[x])
+    away_id = st.selectbox("Away Team", team_ids, format_func=lambda x: TEAM_NAME[x])
 with c2:
-    home_id = st.selectbox("Home Team", team_ids, format_func=lambda x: TEAM_NAME_MAP[x])
+    home_id = st.selectbox("Home Team", team_ids, format_func=lambda x: TEAM_NAME[x])
 with c3:
     manual_total = st.number_input("Market Total (optional)", 0.0, 200.0, 0.0)
 
 if st.button("Project Matchup"):
-    proj = raw_projected_total(home_id, away_id)
+    proj = projected_total(home_id, away_id)
     fallback = kenpom_fallback(proj)
     line = manual_total if manual_total > 0 else fallback
     edge = proj - line
@@ -126,7 +127,7 @@ if st.button("Project Matchup"):
     st.metric("Over Probability %", round(prob * 100, 1))
 
 # ============================================================
-# TODAY'S SLATE (MODEL-FIRST + FALLBACK)
+# TODAY'S SLATE
 # ============================================================
 st.subheader("📅 Today’s Games")
 
@@ -136,15 +137,15 @@ for g in games:
     home_id = g.get("HomeTeamID")
     away_id = g.get("AwayTeamID")
 
-    if home_id not in TEAM_LOOKUP or away_id not in TEAM_LOOKUP:
+    if home_id not in TEAM or away_id not in TEAM:
         continue
 
-    proj = raw_projected_total(home_id, away_id)
+    proj = projected_total(home_id, away_id)
     fallback = kenpom_fallback(proj)
 
-    market_total = g.get("OverUnder")
-    if market_total not in (None, 0):
-        line = float(market_total)
+    market = g.get("OverUnder")
+    if market not in (None, 0):
+        line = float(market)
         source = "Market"
     else:
         line = fallback
@@ -162,7 +163,7 @@ for g in games:
     )
 
     rows.append({
-        "Game": f"{TEAM_NAME_MAP[away_id]} @ {TEAM_NAME_MAP[home_id]}",
+        "Game": f"{TEAM_NAME[away_id]} @ {TEAM_NAME[home_id]}",
         "Line Used": round(line, 2),
         "Line Source": source,
         "Projected Total": round(proj, 2),
@@ -171,14 +172,8 @@ for g in games:
         "Decision": decision
     })
 
-    if decision == "BET":
-        st.session_state.bets.append(f"{TEAM_NAME_MAP[away_id]} @ {TEAM_NAME_MAP[home_id]}")
-
 df = pd.DataFrame(rows)
-
 st.dataframe(df.sort_values("Edge", ascending=False), use_container_width=True)
-
-st.caption(f"Games displayed: {len(df)}")
 
 # ============================================================
 # ROI TRACKING
@@ -186,13 +181,8 @@ st.caption(f"Games displayed: {len(df)}")
 st.subheader("📈 Performance Summary")
 
 if st.session_state.bets:
-    st.write("Grade Bets:")
     for i, bet in enumerate(st.session_state.bets):
-        result = st.selectbox(
-            bet,
-            ["Pending", "Win", "Loss"],
-            key=f"res_{i}"
-        )
+        result = st.selectbox(bet, ["Pending", "Win", "Loss"], key=f"res_{i}")
         if result == "Win":
             st.session_state.bet_log.append(1)
         elif result == "Loss":
@@ -203,12 +193,8 @@ wins = st.session_state.bet_log.count(1)
 losses = st.session_state.bet_log.count(-1)
 units = sum(st.session_state.bet_log)
 
-roi = round((units / total) * 100, 2) if total else 0
-win_pct = round((wins / total) * 100, 2) if total else 0
-
 st.metric("Total Bets", total)
 st.metric("Wins", wins)
 st.metric("Losses", losses)
 st.metric("Units", units)
-st.metric("ROI %", roi)
-st.metric("Win %", win_pct)
+st.metric("ROI %", round((units / total) * 100, 2) if total else 0)
