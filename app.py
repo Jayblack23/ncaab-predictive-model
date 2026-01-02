@@ -5,10 +5,9 @@ import streamlit as st
 import pandas as pd
 import requests
 import math
-import re
 from datetime import date
 
-st.set_page_config(page_title="NCAAB Predictive Betting Model", layout="wide")
+st.set_page_config(page_title="NCAAB Predictive Model", layout="wide")
 
 # ============================================================
 # SESSION STATE (ROI PERSISTENCE)
@@ -25,24 +24,10 @@ if "bets" not in st.session_state:
 LEAGUE_AVG_TEMPO = 68
 LEAGUE_AVG_EFF = 102
 TOTAL_STD_DEV = 11.5
-
-# Fallback regression weights (KenPom-style)
-REGRESSION_WEIGHT = 0.15
+REGRESSION_WEIGHT = 0.15  # KenPom-style regression
 
 # ============================================================
-# TEAM NORMALIZATION
-# ============================================================
-def normalize(name):
-    if not name:
-        return None
-    name = name.lower()
-    name = re.sub(r"\(.*?\)", "", name)
-    name = re.sub(r"[^a-z\s]", "", name)
-    name = re.sub(r"\s+", " ", name)
-    return name.strip()
-
-# ============================================================
-# LOAD TEAM METRICS (2025)
+# LOAD TEAM METRICS (TEAMID-BASED — CRITICAL FIX)
 # ============================================================
 @st.cache_data(ttl=86400)
 def load_teams():
@@ -53,26 +38,18 @@ def load_teams():
     rows = []
     for t in r.json():
         rows.append({
-            "key": normalize(t["Name"]),
-            "name": t["Name"],
-            "tempo": t.get("PossessionsPerGame", LEAGUE_AVG_TEMPO),
-            "oe": t.get("OffensiveEfficiency", LEAGUE_AVG_EFF),
-            "de": t.get("DefensiveEfficiency", LEAGUE_AVG_EFF)
+            "TeamID": t["TeamID"],
+            "Name": t["Name"],
+            "Tempo": t.get("PossessionsPerGame", LEAGUE_AVG_TEMPO),
+            "OE": t.get("OffensiveEfficiency", LEAGUE_AVG_EFF),
+            "DE": t.get("DefensiveEfficiency", LEAGUE_AVG_EFF)
         })
 
     return pd.DataFrame(rows)
 
 teams_df = load_teams()
-TEAM_LOOKUP = {row["key"]: row for _, row in teams_df.iterrows()}
-
-def get_team(name):
-    key = normalize(name)
-    if key in TEAM_LOOKUP:
-        return TEAM_LOOKUP[key]
-    for k, v in TEAM_LOOKUP.items():
-        if key in k or k in key:
-            return v
-    raise ValueError(f"Team not found: {name}")
+TEAM_LOOKUP = teams_df.set_index("TeamID").to_dict("index")
+TEAM_NAME_MAP = teams_df.set_index("TeamID")["Name"].to_dict()
 
 # ============================================================
 # LOAD TODAY'S GAMES
@@ -93,26 +70,21 @@ games = load_games()
 def expected_points(tempo, oe, de):
     return tempo * (oe / de)
 
-def raw_projected_total(home, away):
-    A = get_team(home)
-    B = get_team(away)
+def raw_projected_total(home_id, away_id):
+    A = TEAM_LOOKUP[home_id]
+    B = TEAM_LOOKUP[away_id]
 
-    tempo = (A["tempo"] + B["tempo"]) / 2
+    tempo = (A["Tempo"] + B["Tempo"]) / 2
     tempo *= LEAGUE_AVG_TEMPO / tempo
 
     return (
-        expected_points(tempo, A["oe"], B["de"]) +
-        expected_points(tempo, B["oe"], A["de"])
+        expected_points(tempo, A["OE"], B["DE"]) +
+        expected_points(tempo, B["OE"], A["DE"])
     )
 
-def kenpom_style_fallback(proj):
-    """
-    Light regression to league mean to mimic KenPom totals
-    """
-    return (
-        proj * (1 - REGRESSION_WEIGHT)
-        + (LEAGUE_AVG_TEMPO * 2) * REGRESSION_WEIGHT
-    )
+def kenpom_fallback(proj):
+    league_mean_total = LEAGUE_AVG_TEMPO * 2
+    return proj * (1 - REGRESSION_WEIGHT) + league_mean_total * REGRESSION_WEIGHT
 
 def prob_over(proj, line):
     z = (proj - line) / TOTAL_STD_DEV
@@ -127,24 +99,23 @@ min_prob = st.slider("Min Probability (%)", 50, 65, 55)
 min_edge = st.slider("Min Edge (pts)", 1.0, 6.0, 2.0)
 
 # ============================================================
-# MANUAL MATCHUP TOOL
+# MANUAL MATCHUP TOOL (WORKING DROPDOWNS)
 # ============================================================
-st.subheader("🧪 Manual Matchup")
+st.subheader("🧪 Manual Matchup Projection")
 
-teams = sorted(teams_df["name"].unique())
+team_ids = list(TEAM_NAME_MAP.keys())
+
 c1, c2, c3 = st.columns(3)
-
 with c1:
-    away = st.selectbox("Away Team", teams)
+    away_id = st.selectbox("Away Team", team_ids, format_func=lambda x: TEAM_NAME_MAP[x])
 with c2:
-    home = st.selectbox("Home Team", teams)
+    home_id = st.selectbox("Home Team", team_ids, format_func=lambda x: TEAM_NAME_MAP[x])
 with c3:
-    manual_total = st.number_input("Market Total (Optional)", 0.0, 200.0, 0.0)
+    manual_total = st.number_input("Market Total (optional)", 0.0, 200.0, 0.0)
 
 if st.button("Project Matchup"):
-    proj = raw_projected_total(home, away)
-    fallback = kenpom_style_fallback(proj)
-
+    proj = raw_projected_total(home_id, away_id)
+    fallback = kenpom_fallback(proj)
     line = manual_total if manual_total > 0 else fallback
     edge = proj - line
     prob = prob_over(proj, line)
@@ -162,52 +133,52 @@ st.subheader("📅 Today’s Games")
 rows = []
 
 for g in games:
-    home = g.get("HomeTeam")
-    away = g.get("AwayTeam")
+    home_id = g.get("HomeTeamID")
+    away_id = g.get("AwayTeamID")
 
-    try:
-        proj = raw_projected_total(home, away)
-        fallback = kenpom_style_fallback(proj)
+    if home_id not in TEAM_LOOKUP or away_id not in TEAM_LOOKUP:
+        continue
 
-        market_total = g.get("OverUnder")
-        if market_total not in (None, 0):
-            market_total = float(market_total)
-            line = market_total
-            source = "Market"
-        else:
-            line = fallback
-            source = "Fallback"
+    proj = raw_projected_total(home_id, away_id)
+    fallback = kenpom_fallback(proj)
 
-        edge = proj - line
-        p_over = prob_over(proj, line)
-        prob = max(p_over, 1 - p_over)
+    market_total = g.get("OverUnder")
+    if market_total not in (None, 0):
+        line = float(market_total)
+        source = "Market"
+    else:
+        line = fallback
+        source = "Fallback"
 
-        decision = (
-            "BET" if source == "Market"
-            and prob * 100 >= min_prob
-            and abs(edge) >= min_edge
-            else "PASS"
-        )
+    edge = proj - line
+    p_over = prob_over(proj, line)
+    prob = max(p_over, 1 - p_over)
 
-        rows.append({
-            "Game": f"{away} @ {home}",
-            "Line Used": round(line, 2),
-            "Line Source": source,
-            "Projected Total": round(proj, 2),
-            "Edge": round(edge, 2),
-            "Prob %": round(prob * 100, 1),
-            "Decision": decision
-        })
+    decision = (
+        "BET" if source == "Market"
+        and prob * 100 >= min_prob
+        and abs(edge) >= min_edge
+        else "PASS"
+    )
 
-        if decision == "BET":
-            st.session_state.bets.append(f"{away} @ {home}")
+    rows.append({
+        "Game": f"{TEAM_NAME_MAP[away_id]} @ {TEAM_NAME_MAP[home_id]}",
+        "Line Used": round(line, 2),
+        "Line Source": source,
+        "Projected Total": round(proj, 2),
+        "Edge": round(edge, 2),
+        "Prob %": round(prob * 100, 1),
+        "Decision": decision
+    })
 
-    except Exception as e:
-        st.write("Skipped:", away, "@", home, "Reason:", e)
+    if decision == "BET":
+        st.session_state.bets.append(f"{TEAM_NAME_MAP[away_id]} @ {TEAM_NAME_MAP[home_id]}")
 
 df = pd.DataFrame(rows)
 
 st.dataframe(df.sort_values("Edge", ascending=False), use_container_width=True)
+
+st.caption(f"Games displayed: {len(df)}")
 
 # ============================================================
 # ROI TRACKING
