@@ -1,7 +1,8 @@
 import streamlit as st
 import pandas as pd
 from math import erf, sqrt
-
+if "bet_log" not in st.session_state:
+    st.session_state.bet_log = []
 # ---------- Helper functions ----------
 def normal_cdf(x):
     return (1.0 + erf(x / sqrt(2.0))) / 2.0
@@ -59,3 +60,16 @@ filtered = [
 )
 
 st.dataframe(final_df, use_container_width=True)
+st.subheader("📊 Log Bet Results")
+
+for i, row in final_df.iterrows():
+    if row["Decision"] == "BET":
+        col1, col2, col3 = st.columns([3,1,1])
+
+        col1.write(row["Game"])
+
+        if col2.button("WIN", key=f"win_{i}"):
+            st.session_state.bet_log.append(1)
+
+        if col3.button("LOSS", key=f"loss_{i}"):
+            st.session_state.bet_log.append(-1) 
