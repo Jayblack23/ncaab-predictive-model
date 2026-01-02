@@ -6,8 +6,7 @@ BET_FILE = "bets.csv"
 
 if not os.path.exists(BET_FILE):
     pd.DataFrame(columns=["Result"]).to_csv(BET_FILE, index=False)
-if "bet_log" not in st.session_state:
-    st.session_state.bet_log = []
+bet_history = pd.read_csv(BET_FILE)
 # ---------- Helper functions ----------
 def normal_cdf(x):
     return (1.0 + erf(x / sqrt(2.0))) / 2.0
