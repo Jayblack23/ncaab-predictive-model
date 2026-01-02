@@ -45,46 +45,36 @@ def fetch_team_metrics():
         st.error("Failed to load team metrics")
         st.stop()
 
-    data = []
+    rows = []
     for t in r.json():
-        key = normalize_team(t["Name"])
-        data.append({
-            "key": key,
+        rows.append({
+            "key": normalize_team(t["Name"]),
             "name": t["Name"],
             "tempo": t.get("PossessionsPerGame", LEAGUE_AVG_TEMPO),
             "oe": t.get("OffensiveEfficiency", LEAGUE_AVG_EFF),
             "de": t.get("DefensiveEfficiency", LEAGUE_AVG_EFF)
         })
 
-    df = pd.DataFrame(data)
-    return df
+    return pd.DataFrame(rows)
 
 teams_df = fetch_team_metrics()
 
-# ============================================================
-# BUILD LOOKUP DICTIONARY (CRITICAL FIX)
-# ============================================================
 TEAM_LOOKUP = {
     row["key"]: row
     for _, row in teams_df.iterrows()
 }
 
-# ============================================================
-# RESOLVE TEAM (NO SILENT FAILURE)
-# ============================================================
 def resolve_team(team_name):
     key = normalize_team(team_name)
 
-    # 1. Exact normalized match
     if key in TEAM_LOOKUP:
         return TEAM_LOOKUP[key]
 
-    # 2. Safe partial match (one direction only)
     for k, v in TEAM_LOOKUP.items():
         if key in k or k in key:
             return v
 
-    raise ValueError(f"Unmatched team: {team_name}")
+    raise ValueError(f"Team not found: {team_name}")
 
 # ============================================================
 # FETCH TODAY'S GAMES
@@ -125,7 +115,7 @@ def prob_over(projected, line):
     return 0.5 * (1 + math.erf(z / math.sqrt(2)))
 
 # ============================================================
-# UI
+# UI HEADER
 # ============================================================
 st.title("🏀 College Basketball Predictive Betting Model")
 
@@ -133,21 +123,58 @@ bankroll = st.number_input("Bankroll ($)", value=1000.0)
 min_prob = st.slider("Min Probability (%)", 50, 65, 55)
 min_edge = st.slider("Min Edge (pts)", 1.0, 5.0, 2.0)
 
+# ============================================================
+# MANUAL MATCHUP TOOL (DROPDOWNS)
+# ============================================================
+st.subheader("🧪 Manual Matchup Projection")
+
+team_names = sorted(teams_df["name"].unique())
+
+c1, c2, c3 = st.columns(3)
+with c1:
+    away_team = st.selectbox("Away Team", team_names)
+with c2:
+    home_team = st.selectbox("Home Team", team_names)
+with c3:
+    manual_total = st.number_input("Market Total", min_value=110.0, max_value=180.0, step=0.5)
+
+if st.button("Project Matchup"):
+    try:
+        proj = project_total(home_team, away_team)
+        edge = round(proj - manual_total, 2)
+        p_over = prob_over(proj, manual_total)
+
+        st.metric("Projected Total", round(proj, 2))
+        st.metric("Edge vs Market", edge)
+        st.metric("Over Probability %", round(p_over * 100, 1))
+    except:
+        st.error("Unable to project matchup")
+
+# ============================================================
+# TODAY'S SLATE
+# ============================================================
+st.subheader("📅 Today’s Games")
+
 rows = []
 games_with_totals = 0
 games_processed = 0
 games_skipped = 0
 
-# ============================================================
-# MAIN LOOP
-# ============================================================
 for g in games:
     home = g.get("HomeTeam")
     away = g.get("AwayTeam")
+    status = g.get("Status")
+
+    if status != "Scheduled":
+        continue
 
     try:
         market_total = float(g.get("OverUnder"))
     except:
+        continue
+
+    # Sanity check
+    if market_total < 110 or market_total > 180:
         continue
 
     games_with_totals += 1
@@ -171,16 +198,16 @@ for g in games:
 
         games_processed += 1
 
-    except Exception as e:
+    except:
         games_skipped += 1
 
 # ============================================================
-# DISPLAY
+# DISPLAY RESULTS
 # ============================================================
 df = pd.DataFrame(rows)
 
 if df.empty:
-    st.error("Team resolution failed — check alias coverage.")
+    st.warning("No valid games available yet.")
 else:
     st.dataframe(df.sort_values("Edge", ascending=False), use_container_width=True)
 
