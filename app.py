@@ -18,7 +18,9 @@ CONF_THRESHOLD = 0.60
 EDGE_THRESHOLD = 3.0
 BANKROLL = 100.0
 
-MIN_GAME_POSSESSIONS = 68  # critical fix
+MIN_GAME_POSSESSIONS = 68
+PACE_SMOOTHING = 0.35
+HOME_BONUS = 1.8
 
 # ============================================================
 # TEAM NAME NORMALIZATION
@@ -105,21 +107,26 @@ def load_odds():
     return requests.get(url, params=params).json()
 
 # ============================================================
-# CORE MODEL (FIXED)
+# CORE MODEL (FIXED + CALIBRATED)
 # ============================================================
 
 def projected_total(home, away, TEAM):
     h = TEAM[home]
     a = TEAM[away]
 
-    # Realistic NCAA game possessions
-    possessions = max((h["poss"] + a["poss"]) / 2, MIN_GAME_POSSESSIONS)
+    # Smoothed possessions
+    raw_poss = (h["poss"] + a["poss"]) / 2
+    possessions = raw_poss + PACE_SMOOTHING * (MIN_GAME_POSSESSIONS - raw_poss)
 
-    # Convert ratings to PPP
-    home_ppp = ((h["off"] / 100) + (1 - a["def"] / 100)) / 2
-    away_ppp = ((a["off"] / 100) + (1 - h["def"] / 100)) / 2
+    # Proper efficiency interaction (PPP)
+    home_ppp = (h["off"] / 100) * (a["def"] / 100)
+    away_ppp = (a["off"] / 100) * (h["def"] / 100)
 
     total = possessions * (home_ppp + away_ppp)
+
+    # Home-court scoring premium
+    total += HOME_BONUS
+
     return round(total, 1)
 
 def prob_over(proj, line):
