@@ -9,18 +9,15 @@ st.set_page_config(page_title="NCAAB Predictive Totals Model", layout="wide")
 # CONFIG
 # ============================================================
 
-SPORTSDATAIO_KEY = st.secrets["SPORTSDATAIO_API_KEY"]
 ODDS_API_KEY = st.secrets["ODDS_API_KEY"]
-
-SEASON = "2025"
 
 CONF_THRESHOLD = 0.60
 EDGE_THRESHOLD = 3.0
 
 MIN_GAME_POSSESSIONS = 68
-PACE_SMOOTHING = 0.35
+PACE_SMOOTHING = 0.30
 HOME_BONUS = 1.8
-LEAGUE_AVG_RTG = 100  # SportsDataIO scale
+LEAGUE_AVG_RTG = 100
 
 # ============================================================
 # TEAM NAME NORMALIZATION
@@ -36,16 +33,13 @@ ALIASES = {
 }
 
 def normalize(name):
-    if not name:
-        return ""
-    name = (
+    return (
         name.lower()
         .replace("&", "and")
         .replace(".", "")
         .replace("'", "")
         .strip()
     )
-    return ALIASES.get(name, name)
 
 def resolve(name, teams):
     for t in teams:
@@ -54,45 +48,30 @@ def resolve(name, teams):
     return None
 
 # ============================================================
-# LOAD TEAM STATS (SPORTSDATAIO)
+# LOAD TEAM EFFICIENCY DATA (NO SPORTSDATAIO)
 # ============================================================
 
 @st.cache_data(ttl=86400)
 def load_team_stats():
-    url = f"https://api.sportsdata.io/v3/cbb/stats/json/TeamSeasonStats/{SEASON}"
-    headers = {"Ocp-Apim-Subscription-Key": SPORTSDATAIO_KEY}
-    data = requests.get(url, headers=headers).json()
+    # Example public Torvik-style CSV
+    url = "https://raw.githubusercontent.com/roclark/ncaab-data/main/torvik_efficiencies.csv"
+    df = pd.read_csv(url)
 
     teams = {}
 
-    for t in data:
-        g = t.get("Games", 0)
-        if g == 0:
-            continue
+    for _, r in df.iterrows():
+        team = normalize(r["Team"])
 
-        fga = t.get("FieldGoalsAttempted", 0)
-        fta = t.get("FreeThrowsAttempted", 0)
-        orb = t.get("OffensiveRebounds", 0)
-        tov = t.get("Turnovers", 0)
-
-        poss = (fga - orb + tov + 0.44 * fta) / g
-
-        off_ppg = t.get("PointsPerGame", 0)
-        opp_ppg = t.get("OpponentPointsPerGame", 0)
-
-        off_rtg = (off_ppg / poss) * 100 if poss > 0 else 100
-        def_rtg = (opp_ppg / poss) * 100 if poss > 0 else 100
-
-        teams[normalize(t["Name"])] = {
-            "poss": poss,
-            "off": off_rtg,
-            "def": def_rtg,
+        teams[team] = {
+            "poss": r["Tempo"],
+            "off": r["AdjOE"],
+            "def": r["AdjDE"],
         }
 
     return teams
 
 # ============================================================
-# LOAD ODDS (ODDS API)
+# LOAD ODDS
 # ============================================================
 
 @st.cache_data(ttl=300)
@@ -107,7 +86,7 @@ def load_odds():
     return requests.get(url, params=params).json()
 
 # ============================================================
-# CORE MODEL (CORRECTED)
+# CORE MODEL
 # ============================================================
 
 def projected_total(home, away, TEAM):
@@ -118,7 +97,7 @@ def projected_total(home, away, TEAM):
     raw_poss = (h["poss"] + a["poss"]) / 2
     possessions = raw_poss + PACE_SMOOTHING * (MIN_GAME_POSSESSIONS - raw_poss)
 
-    # Correct efficiency interaction (league-normalized)
+    # League-normalized PPP interaction
     home_ppp = (h["off"] / LEAGUE_AVG_RTG) * (LEAGUE_AVG_RTG / a["def"])
     away_ppp = (a["off"] / LEAGUE_AVG_RTG) * (LEAGUE_AVG_RTG / h["def"])
 
@@ -138,7 +117,7 @@ def prob_over(proj, line):
 # UI
 # ============================================================
 
-st.title("🏀 NCAAB Predictive Totals Model")
+st.title("🏀 NCAAB Predictive Totals Model (No SportsDataIO)")
 
 TEAM = load_team_stats()
 ODDS = load_odds()
