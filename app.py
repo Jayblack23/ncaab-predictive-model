@@ -19,21 +19,14 @@ TOTAL_STD_DEV = 11.5
 MARKET_CALIBRATION_WEIGHT = 0.25
 
 # ============================================================
-# SESSION STATE
-# ============================================================
-for k in ["bet_log", "clv_log"]:
-    if k not in st.session_state:
-        st.session_state[k] = []
-
-# ============================================================
-# SAFE TEAM NORMALIZATION (FIXED)
+# SAFE TEAM NORMALIZATION
 # ============================================================
 def normalize_team(name):
     if not name:
         return None
     name = name.lower()
-    name = re.sub(r"\(.*?\)", "", name)   # remove (FL), (CA)
-    name = re.sub(r"[^a-z\s]", "", name)  # remove punctuation
+    name = re.sub(r"\(.*?\)", "", name)
+    name = re.sub(r"[^a-z\s]", "", name)
     name = re.sub(r"\s+", " ", name)
     return name.strip()
 
@@ -52,37 +45,46 @@ def fetch_team_metrics():
         st.error("Failed to load team metrics")
         st.stop()
 
-    rows = []
+    data = []
     for t in r.json():
-        rows.append({
-            "Team": t["Name"],
-            "Key": normalize_team(t["Name"]),
-            "Tempo": t.get("PossessionsPerGame", LEAGUE_AVG_TEMPO),
-            "AdjOE": t.get("OffensiveEfficiency", LEAGUE_AVG_EFF),
-            "AdjDE": t.get("DefensiveEfficiency", LEAGUE_AVG_EFF)
+        key = normalize_team(t["Name"])
+        data.append({
+            "key": key,
+            "name": t["Name"],
+            "tempo": t.get("PossessionsPerGame", LEAGUE_AVG_TEMPO),
+            "oe": t.get("OffensiveEfficiency", LEAGUE_AVG_EFF),
+            "de": t.get("DefensiveEfficiency", LEAGUE_AVG_EFF)
         })
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(data)
+    return df
 
-teams = fetch_team_metrics()
+teams_df = fetch_team_metrics()
 
 # ============================================================
-# TEAM LOOKUP WITH FALLBACK MATCHING
+# BUILD LOOKUP DICTIONARY (CRITICAL FIX)
 # ============================================================
-def lookup_team(team_name):
+TEAM_LOOKUP = {
+    row["key"]: row
+    for _, row in teams_df.iterrows()
+}
+
+# ============================================================
+# RESOLVE TEAM (NO SILENT FAILURE)
+# ============================================================
+def resolve_team(team_name):
     key = normalize_team(team_name)
 
-    # Exact match
-    exact = teams[teams.Key == key]
-    if not exact.empty:
-        return exact.iloc[0]
+    # 1. Exact normalized match
+    if key in TEAM_LOOKUP:
+        return TEAM_LOOKUP[key]
 
-    # Fallback: partial match (safe)
-    partial = teams[teams.Key.str.contains(key) | key in teams.Key.values]
-    if not partial.empty:
-        return partial.iloc[0]
+    # 2. Safe partial match (one direction only)
+    for k, v in TEAM_LOOKUP.items():
+        if key in k or k in key:
+            return v
 
-    raise ValueError(f"Team not found: {team_name}")
+    raise ValueError(f"Unmatched team: {team_name}")
 
 # ============================================================
 # FETCH TODAY'S GAMES
@@ -107,15 +109,15 @@ def expected_points(tempo, off_eff, def_eff):
     return tempo * (off_eff / def_eff)
 
 def project_total(home, away):
-    A = lookup_team(home)
-    B = lookup_team(away)
+    A = resolve_team(home)
+    B = resolve_team(away)
 
-    tempo = (A.Tempo + B.Tempo) / 2
+    tempo = (A["tempo"] + B["tempo"]) / 2
     tempo *= LEAGUE_AVG_TEMPO / tempo
 
     return (
-        expected_points(tempo, A.AdjOE, B.AdjDE) +
-        expected_points(tempo, B.AdjOE, A.AdjDE)
+        expected_points(tempo, A["oe"], B["de"]) +
+        expected_points(tempo, B["oe"], A["de"])
     )
 
 def prob_over(projected, line):
@@ -153,7 +155,8 @@ for g in games:
     try:
         proj = project_total(home, away)
         edge = round(proj - market_total, 2)
-        prob = max(prob_over(proj, market_total), 1 - prob_over(proj, market_total))
+        p_over = prob_over(proj, market_total)
+        prob = max(p_over, 1 - p_over)
 
         decision = "BET" if prob * 100 >= min_prob and abs(edge) >= min_edge else "PASS"
 
@@ -177,7 +180,7 @@ for g in games:
 df = pd.DataFrame(rows)
 
 if df.empty:
-    st.error("Games detected but could not be matched. Check team resolution.")
+    st.error("Team resolution failed — check alias coverage.")
 else:
     st.dataframe(df.sort_values("Edge", ascending=False), use_container_width=True)
 
